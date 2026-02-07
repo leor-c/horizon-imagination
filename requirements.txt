@@ -1,0 +1,17 @@
+einops
+loguru
+lightning
+torch
+torchvision
+gymnasium[other]
+requests
+portal-env
+wandb
+torchrl
+tensordict
+click
+imageio[ffmpeg]
+tqdm
+matplotlib
+rich
+scipy
