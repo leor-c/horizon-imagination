@@ -34,19 +34,23 @@ HI proposes a sampling schedule that improves over the popular Pyramidal schedul
 
 This repository contains the training and evaluation code used in the ICLR 2026 paper.
 
+-----
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/f80f2873-429c-4437-af6d-50047b004118" alt="demo">
+  <img src="https://github.com/user-attachments/assets/e9d728b9-223c-4408-a7a1-2aedb9629efd" alt="demo">
+  <!-- <img src="https://github.com/user-attachments/assets/f80f2873-429c-4437-af6d-50047b004118" alt="demo"> -->
 </p>
 
 
-Baselines:
-- Reconstruction: autoencoder only (no world model predictions)
-- Fixed: the denoising is conditioned on the recorded action sequence from the replay buffer
-- Naive: the denoising is conditioned on actions from the learned policy with naive action sampling at each denoising step
-- Ours: the denoising is conditioned on actions from the learned policy with the proposed stable action sampling mechanism
+Imagined rollout starting from a few context frames (blue border) with the following baselines:
+- Reconstruction: autoencoder only (no world model predictions) reconstruction of the stored context continuation (raplay buffer)
+- Fixed: imagination is conditioned on the recorded action sequence from the replay buffer
+- Naive: imagination is conditioned on actions from the learned policy with naive action sampling at each denoising step
+- Ours: imagination is conditioned on actions from the learned policy with the proposed stable action sampling mechanism
 
-Note: The model was trained under a limited interaction budget of just 100K environment steps!
+Note: The above videos were geneated using *one* denoising step per frame. The model was trained under a limited interaction budget of just 100K environment steps!
+
+
 
 ---
 
