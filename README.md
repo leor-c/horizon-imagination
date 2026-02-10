@@ -82,7 +82,7 @@ Make sure to run the above command from the project root directory.
 ## 🎮 Training an Online Agent
 
 Training uses a **client–server setup**.  
-We strongly recommend using `tmux` (or another terminal multiplexer).
+Run `tmux` (within the Docker container), and execute the following command to start the server:
 
 ### 1️⃣ Start the environment server
 ```bash
@@ -100,7 +100,8 @@ portal-env start ale -b mm
 
 ---
 
-### 2️⃣ Launch training (new tmux pane)
+### 2️⃣ Launch training (new tmux tab)
+Start a new tmux tab (`Ctrl-b c`) and launch a training run via
 ```bash
 python experiments/train_agent_online.py \
   -b <env_name> \
@@ -127,7 +128,6 @@ horizon_imagination/
 ├── scripts/               # Utilities (setup, analysis, plotting)
 ├── outputs/               # Local artifacts (logs, checkpoints)
 ├── results/               # Official results reported in the paper
-├── tests/                 # Lightweight sanity checks
 └── README.md
 ```
 
