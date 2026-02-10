@@ -102,14 +102,14 @@ portal-env start ale -b mm
 
 ### 2️⃣ Launch training (new tmux pane)
 ```bash
-PYTHONPATH=. python experiments/train_agent_online.py \
+python experiments/train_agent_online.py \
   -b <env_name> \
   -g <game_id>
 ```
 
 Example:
 ```bash
-PYTHONPATH=. python experiments/train_agent_online.py \
+python experiments/train_agent_online.py \
   -b ale \
   -g ALE/Boxing-v5
 ```
