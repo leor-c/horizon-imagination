@@ -9,9 +9,9 @@ from tensordict.tensordict import TensorDict
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass, field
 from horizon_imagination.utilities.types import ObsKey
 from horizon_imagination.utilities import AdamWConfig, shift_fwd
-from horizon_imagination.diffusion import RectifiedFlow, LogitNormalTimeSampler, BetaTimeSampler, TimeSamplerBase
+from horizon_imagination.diffusion import RectifiedFlow, BetaTimeSampler, TimeSamplerBase
 from horizon_imagination.diffusion.samplers import (
-    EulerSampler, UniformSamplerScheduler, LinearQuadraticSamplerScheduler, SamplerScheduler
+    EulerSampler, SamplerScheduler
 )
 from horizon_imagination.models.world_model.denoiser import DenoiserBase, VideoDiTDenoiser
 from horizon_imagination.models.world_model.action_producer import ActionProducer
