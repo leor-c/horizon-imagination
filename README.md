@@ -150,12 +150,12 @@ If you use this code, please cite:
 
 ```bibtex
 @inproceedings{
-    cohen2026horizon,
-    title={Horizon Imagination: Efficient On-Policy Training in Diffusion World Models},
-    author={Lior Cohen and Ofir Nabati and Kaixin Wang and Navdeep Kumar and Shie Mannor},
-    booktitle={The Fourteenth International Conference on Learning Representations},
-    year={2026},
-    url={https://openreview.net/forum?id=Obefq4k8iG}
+  cohen2026horizon,
+  title={Horizon Imagination: Efficient On-Policy Rollout in Diffusion World Models},
+  author={Lior Cohen and Ofir Nabati and Kaixin Wang and Navdeep Kumar and Shie Mannor},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://openreview.net/forum?id=Obefq4k8iG}
 }
 
 
