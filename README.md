@@ -2,7 +2,7 @@
 # 🌅 Horizon Imagination (HI) — ICLR 2026
 
 <p align="center">
-  <b>Efficient On-Policy Training in Diffusion World Models</b><br/>
+  <b>Efficient On-Policy Rollout in Diffusion World Models</b><br/>
   <a href="https://openreview.net/forum?id=Obefq4k8iG">📄 OpenReview</a>
   ·
   <a href="#-quickstart">🚀 Quickstart</a>
