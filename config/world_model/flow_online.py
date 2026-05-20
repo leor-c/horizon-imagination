@@ -55,6 +55,8 @@ def get_world_model_online_config(
             ln_eps=1e-5,
         ),
         action_space=action_space,
+        spatial_patch_size=patch_spatial,
+        img_latent_channels=tokenizer_channels,
     )
 
     # Tokenizer:
