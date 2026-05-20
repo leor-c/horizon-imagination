@@ -29,12 +29,10 @@
   <img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg">
 </p>
 
-Horizon Imagination improves the imagination efficiency of diffusion-based world models, enabling effective generations with sub-frame budgets and efficient on-policy generation for training lightweight controllers in imagination. 
+Horizon Imagination improves the imagination efficiency of diffusion-based world models, enabling effective generations with sub-step budgets and efficient on-policy generation for training lightweight controllers in imagination. 
 HI proposes a sampling schedule that improves over the popular Pyramidal schedule (Diffusion Forcing).
 
 This repository contains the training and evaluation code used in the ICLR 2026 paper.
-
-
 
 
 <p align="center">
@@ -51,6 +49,22 @@ Imagined rollout starting from a few context frames (blue border) with the follo
 
 Note: The above videos were geneated using *one* denoising step per frame. The model was trained under a limited interaction budget of just 100K environment steps!
 -->
+
+
+
+
+
+
+## 🌿 Branches
+
+- `main` — stable, up-to-date code reflecting the latest tested improvements
+- `dev` — active development and integration of new features
+- `feat/*` — individual feature branches, merged into `dev` when complete
+- `iclr-2026` — frozen snapshot of the code used to reproduce the results in the paper
+
+
+
+
 
 ---
 
