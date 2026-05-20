@@ -170,3 +170,64 @@ class ImageLatentToVecTransform(BaseTransform, nn.Module, Configurable):
     
     def inverse(self, z, *args, **kwargs):
         return 
+
+
+class ImagePatcherTransform(BaseTransform, nn.Module, Configurable):
+    @dataclass
+    class Config(BaseConfig):
+        spatial_patch_size: int = 2
+        in_channels: int = 6
+        out_channels: int = 512
+        device: torch.device = None
+        dtype: torch.dtype = None
+
+    def __init__(self, config: Config, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        temporal_patch_size = 1
+        spatial_patch_size = self.config.spatial_patch_size
+        in_dim = self.config.in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
+        self.fwd_proj = nn.Sequential(
+            Rearrange(
+                "b (t r) c (h m) (w n) -> b t h w (c r m n)",
+                r=temporal_patch_size,
+                m=self.config.spatial_patch_size,
+                n=self.config.spatial_patch_size,
+            ),
+            nn.Linear(
+                in_dim,
+                self.config.out_channels,
+                bias=False,
+                device=self.config.device,
+                dtype=self.config.dtype
+            ),
+        )
+
+        # init weights:
+        std = 1.0 / sqrt(in_dim)
+        torch.nn.init.trunc_normal_(self.fwd_proj[1].weight, std=std, a=-3 * std, b=3 * std)
+
+        self.bwd_proj = nn.Sequential(
+            nn.Linear(
+                self.config.out_channels,
+                self.config.in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size,
+                bias=False,
+                device=self.config.device,
+                dtype=self.config.dtype
+            ),
+            Rearrange(
+                "b t h w (c r m n) -> b (t r) c (h m) (w n)",
+                r=temporal_patch_size,
+                m=self.config.spatial_patch_size,
+                n=self.config.spatial_patch_size,
+            ),
+        )
+
+        std = 1.0 / sqrt(self.config.out_channels)
+        torch.nn.init.trunc_normal_(self.bwd_proj[0].weight, std=std, a=-3 * std, b=3 * std)
+
+    def transform(self, x, *args, **kwargs):
+        return self.fwd_proj(x, *args, **kwargs)
+
+    def inverse(self, z, *args, **kwargs):
+        return self.bwd_proj(z, *args, **kwargs)

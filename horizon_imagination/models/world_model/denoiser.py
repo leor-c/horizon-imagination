@@ -16,9 +16,11 @@ from loguru import logger
 from horizon_imagination.diffusion import DenoiserBase
 from horizon_imagination.utilities.config import Configurable, BaseConfig
 from horizon_imagination.utilities.types import ObsKey, Modality
-from horizon_imagination.modules.transform import BaseTransform, PerModalityTransform, MultiModalCatAndFlatten
+from horizon_imagination.modules.transform import (
+    BaseTransform, PerModalityTransform, MultiModalCatAndFlatten, ImagePatcherTransform
+)
 
-from horizon_imagination.models.world_model.dit import DiT, ModelState
+from horizon_imagination.models.world_model.dit import DiT, KVCache
 
 
 class DiscreteActionEmbedder(nn.Module):
@@ -40,18 +42,23 @@ class DiscreteActionEmbedder(nn.Module):
         noised_actions = one_hots
 
         return self.linear(noised_actions.to(self.linear.weight.dtype))
-    
+
 
 class VideoDiTDenoiser(DenoiserBase, Configurable):
     @dataclass
     class Config(BaseConfig):
         dit_cfg: DiT.Config
+        spatial_patch_size: int
+        img_latent_channels: int
+        # The length (in tokens / embeddings) of each obs item:
+        # obs_items_lengths: OrderedDict[ObsKey, int]
+        # per_modality_transforms: PerModalityTransform
         action_space: gym.Space
 
         @property
         def device(self):
             return self.dit_cfg.device
-        
+
         @property
         def dtype(self):
             return self.dit_cfg.dtype
@@ -63,13 +70,19 @@ class VideoDiTDenoiser(DenoiserBase, Configurable):
         self.dit = config.dit_cfg.make_instance()
 
         self.action_embedder = self._build_action_embedder()
+        self.image_patcher: ImagePatcherTransform = ImagePatcherTransform.Config(
+            spatial_patch_size=config.spatial_patch_size,
+            in_channels=config.img_latent_channels,
+            out_channels=config.dit_cfg.model_channels,
+        ).make_instance()
 
     def _build_action_embedder(self):
         action_space = self.config.action_space
         if isinstance(action_space, gym.spaces.Discrete):
             action_embedder = nn.Embedding(
-                action_space.n, 
-                self.embed_dim, 
+                action_space.n,
+                self.embed_dim,
+                device=self.config.dit_cfg.device,
             )
 
             std = 1.0 / math.sqrt(self.embed_dim)
@@ -79,18 +92,19 @@ class VideoDiTDenoiser(DenoiserBase, Configurable):
         else:
             # TODO: support more action modalities
             raise NotImplementedError(f"Currently action space {action_space} is not supported.")
-    
+
     @property
     def embed_dim(self):
         return self.config.dit_cfg.model_channels
 
     def denoise(
-            self, 
-            x: TensorDict[ObsKey, Tensor], 
-            t: Tensor, 
-            actions: Tensor = None, 
+            self,
+            x: TensorDict[ObsKey, Tensor],
+            t: Tensor,
+            actions: Tensor = None,
+            kv_cache: KVCache = None,
             **kwargs
-        ) -> tuple[TensorDict[ObsKey, Tensor], ModelState]:
+    ) -> tuple[TensorDict[ObsKey, Tensor], KVCache]:
         # Assume x is encoded to "latent" form, but not flattened yet.
         # latent form is the output of the tokenizer.
         assert isinstance(x, TensorDict), f"Got {type(x)}"
@@ -99,13 +113,17 @@ class VideoDiTDenoiser(DenoiserBase, Configurable):
 
         action_embeddings = self.action_embedder(actions)
         assert action_embeddings.dim() == 3, f"Got shape {action_embeddings.shape}"
-        # no action before the first observation! use a zeros vector:
-        action_embeddings[:, 0] = 0
+        # No action before the first observation of a fresh sequence.
+        # When continuing from KV-cache, token 0 already has a valid predecessor.
+        if kv_cache is None or len(kv_cache) == 0:
+            action_embeddings[:, 0] = 0
 
         c = action_embeddings
 
         # Compute model outputs:
-        outputs, state = self.dit(x[img_key], t, c)
+        z = self.image_patcher.transform(x[img_key])
+        outputs, new_kv_cache = self.dit(z, t, c, kv_cache=kv_cache)
+        outputs = self.image_patcher.inverse(outputs)
         outputs = TensorDict({img_key: outputs}, batch_size=x.batch_size, device=x.device)
 
-        return outputs, state
+        return outputs, new_kv_cache

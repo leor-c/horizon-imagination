@@ -13,7 +13,7 @@ from horizon_imagination.diffusion import RectifiedFlow, BetaTimeSampler, TimeSa
 from horizon_imagination.diffusion.samplers import (
     EulerSampler, SamplerScheduler
 )
-from horizon_imagination.models.world_model.denoiser import DenoiserBase, VideoDiTDenoiser
+from horizon_imagination.models.world_model.denoiser import DenoiserBase, VideoDiTDenoiser, KVCache
 from horizon_imagination.models.world_model.action_producer import ActionProducer
 from horizon_imagination.models.world_model.reward_done_model import RewardDoneModel
 from horizon_imagination.modules.transform import PerModalityTransform
@@ -56,15 +56,15 @@ class DenoiserWithPolicyWrapper(DenoiserBase):
         self.actions_buffer = []
         self.log_pi_buffer = []
         self.denoising_times = []
-        self.denoiser_state = None
+        self.denoiser_kv_cache: KVCache | None = None
 
     def denoise(
-        self, 
-        x: TensorDict, 
-        t: Tensor, 
-        state: Any = None, 
-        *args, 
-        **kwargs
+            self,
+            x: TensorDict,
+            t: Tensor,
+            dt: Tensor = None,
+            *args,
+            **kwargs
     ) -> tuple[TensorDict, Any]:
         """
         :param x: the noisy observation to be denoised. shape (B T C H W)
@@ -83,21 +83,55 @@ class DenoiserWithPolicyWrapper(DenoiserBase):
         self.log_pi_buffer.append(log_pi)
 
         # Shift actions to maintain causality (a_t affects o_{t+1}):
-        if self.context_actions is not None:
-            actions = torch.cat([self.context_actions, actions], dim=1)
-            x = torch.cat([self.context_obs, x], dim=1)
-            t = torch.cat([self.context_t, t], dim=1)
-        
+        assert self.context_len > 0
+        actions = torch.cat([self.context_actions, actions], dim=1)
         actions = shift_fwd(actions)
+
+        if self.denoiser_kv_cache is None:
+            x_ = torch.cat([self.context_obs, x], dim=1)
+            t_ = torch.cat([self.context_t, t], dim=1)
+            dt_ = torch.cat([torch.zeros_like(self.context_t), dt], dim=1)
+            start = self.context_len
+            end = torch.logical_or(dt_[0] > 0, t_[0] > 0).sum()  # truncate suffix with dt == 0
+
+            actions = actions[:, :end]
+            x_ = x_[:, :end]
+            t_ = t_[:, :end]
+
+        else:
+            t_ = t
+            dt_ = dt
+            actions = actions[:, self.context_len:]
+
+            start = self.denoiser_kv_cache.length - self.context_len
+            end = torch.logical_or(dt_[0] > 0, t_[0] > 0).sum()
+
+            actions = actions[:, start:end]
+            x_ = x[:, start:end]
+            t_ = t[:, start:end]
+
+        kv_cache = self.denoiser_kv_cache
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             with torch.no_grad():
-                denoised, self.denoiser_state = self.denoiser(x, t, actions=actions)
+                denoised, new_kv_cache = self.denoiser(x_, t_, actions=actions, kv_cache=kv_cache)
 
-                if self.context_actions is not None:
-                    denoised = denoised[:, self.context_len:]
+        out = torch.zeros_like(x)
+        n_clean = (t_[0] == 1).sum()
+        if self.denoiser_kv_cache is None:
+            assert n_clean == self.context_len, f"got {n_clean}, expected {self.context_len}"
+            self.denoiser_kv_cache = new_kv_cache[
+                :, :n_clean]  # keeping context + noise seq, to avoid concat at every step.
+            # noise seq elements will be overridden in later calls.
 
-        return denoised
+            out[:, :end - self.context_len] = denoised[:, self.context_len:]
+        else:
+            if n_clean > 0:
+                self.denoiser_kv_cache.concat_inplace(new_kv_cache[:, :n_clean])
+
+            out[:, start:end] = denoised
+
+        return out
     
     def get_buffers(self):
         return self.actions_buffer, self.log_pi_buffer, self.denoising_times

@@ -12,7 +12,6 @@ class RewardDoneModel(nn.Module, Configurable):
     @dataclass
     class Config(BaseConfig):
         backbone_config: LightweightSeqModel.Config
-        hl_gauss_num_bins: int = 129
 
     def __init__(self, config: Config, *args, **kwargs):
         super().__init__(*args, **kwargs)

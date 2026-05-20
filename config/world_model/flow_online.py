@@ -88,7 +88,6 @@ def get_world_model_online_config(
             device=device,
             dtype=dtype
         ),
-        hl_gauss_num_bins=129
     )
 
     if baseline == 'ar':

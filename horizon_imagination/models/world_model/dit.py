@@ -26,6 +26,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -97,9 +98,9 @@ class GPT2FeedForward(nn.Module):
 
 
 def torch_attention_op(
-        q_B_S_H_D: torch.Tensor, 
-        k_B_S_H_D: torch.Tensor, 
-        v_B_S_H_D: torch.Tensor, 
+        q_B_S_H_D: torch.Tensor,
+        k_B_S_H_D: torch.Tensor,
+        v_B_S_H_D: torch.Tensor,
         attn_mask = None
     ) -> torch.Tensor:
     """Computes multi-head attention using PyTorch's native implementation.
@@ -130,14 +131,14 @@ def torch_attention_op(
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     result_B_S_HD = rearrange(
-        torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, attn_mask=attn_mask), 
+        torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, attn_mask=attn_mask),
         "b h ... l -> b ... (h l)"
     )
 
     return result_B_S_HD
 
 
-class KVCache:
+class LayerKVCache:
     def __init__(self, keys: torch.Tensor, values: torch.Tensor):
         self._k = keys
         self._v = values
@@ -145,10 +146,120 @@ class KVCache:
     @property
     def keys(self):
         return self._k
-    
+
     @property
     def values(self):
         return self._v
+
+    @property
+    def length(self):
+        return self._k.shape[1]  # sequence dim
+
+    def __len__(self):
+        return self.length
+
+
+class KVCache:
+    def __init__(self, layers_kv_caches: List[LayerKVCache | None]):
+        self.layers_kv_caches = layers_kv_caches
+
+    def concat_inplace(self, other: "KVCache", dim: int = 1) -> None:
+        assert len(self.layers_kv_caches) == len(other.layers_kv_caches)
+        for i, (a, b) in enumerate(zip(self.layers_kv_caches, other.layers_kv_caches)):
+            if a is not None and b is not None:
+                self.layers_kv_caches[i] = LayerKVCache(
+                    keys=torch.cat([a.keys, b.keys], dim=dim),
+                    values=torch.cat([a.values, b.values], dim=dim),
+                )
+            else:
+                assert a is None and b is None
+                self.layers_kv_caches[i] = None
+
+    def concat(self, other: "KVCache", dim: int = 1) -> "KVCache":
+        assert len(self.layers_kv_caches) == len(other.layers_kv_caches)
+        new_layers = []
+        for a, b in zip(self.layers_kv_caches, other.layers_kv_caches):
+            new_layers.append(
+                LayerKVCache(
+                    keys=torch.cat([a.keys, b.keys], dim=dim),
+                    values=torch.cat([a.values, b.values], dim=dim),
+                )
+            )
+        return KVCache(new_layers)
+
+    def __getitem__(self, idx: Any) -> "KVCache":
+        new_layers: List[Optional[LayerKVCache]] = []
+        for layer in self.layers_kv_caches:
+            if layer is None:
+                new_layers.append(None)
+            else:
+                new_layers.append(
+                    LayerKVCache(
+                        keys=layer.keys[idx],
+                        values=layer.values[idx],
+                    )
+                )
+        return KVCache(new_layers)
+
+    def __setitem__(self, idx, other: "KVCache") -> None:
+        assert isinstance(other, KVCache)
+        assert len(self.layers_kv_caches) == len(other.layers_kv_caches)
+
+        for i, (a, b) in enumerate(zip(self.layers_kv_caches, other.layers_kv_caches)):
+            if a is None or b is None:
+                assert a is None and b is None
+                continue
+            a.keys[idx].copy_(b.keys)
+            a.values[idx].copy_(b.values)
+
+    @property
+    def length(self) -> int:
+        for layer in self.layers_kv_caches:
+            if layer is not None:
+                assert isinstance(layer, LayerKVCache)
+                return layer.length
+        return 0
+
+    def __len__(self) -> int:
+        return self.length
+
+
+def _kv_cache_integration(k, v, video_size: VideoSize, kv_cache: Optional[LayerKVCache] = None):
+    h, w = video_size.H, video_size.W
+    new_cache = LayerKVCache(
+        rearrange(k, 'B (t h w) ... -> B t (h w) ...', h=h, w=w),
+        rearrange(v, 'B (t h w) ... -> B t (h w) ...', h=h, w=w),
+    )
+
+    if kv_cache is not None:
+        k = torch.cat((kv_cache.keys.flatten(1, 2), k), dim=1)
+        v = torch.cat((kv_cache.values.flatten(1, 2), v), dim=1)
+
+    return new_cache, k, v
+
+
+@lru_cache(maxsize=64)
+def _make_block_causal_mask(h: int, w: int, q_seq_len: int, k_seq_len: int, device):
+    frame_numel = h * w
+    assert (q_seq_len % frame_numel == 0) and (k_seq_len % frame_numel == 0), \
+    f"got {q_seq_len} or {k_seq_len} % {frame_numel} != 0"
+
+    num_frames_q = q_seq_len // frame_numel
+    # block diagonal:
+    block_diag = torch.ones((frame_numel, frame_numel), dtype=torch.bool, device=device)
+    block_diag = torch.block_diag(*([block_diag] * num_frames_q))
+
+    # lower triangular:
+    tril = torch.tril(torch.ones((q_seq_len, q_seq_len), dtype=torch.bool, device=device))
+
+    block_tril_mask = torch.logical_or(tril, block_diag)
+
+    if k_seq_len != q_seq_len:
+        assert k_seq_len > q_seq_len, f"Got keys dim={k_seq_len} < query dim = {q_seq_len}"
+        history_mask = torch.ones(q_seq_len, k_seq_len-q_seq_len, device=device, dtype=torch.bool)
+        block_tril_mask = torch.cat([history_mask, block_tril_mask], dim=1)
+
+    return rearrange(block_tril_mask, "L S -> 1 1 L S")
 
 
 class Attention(nn.Module):
@@ -301,37 +412,14 @@ class Attention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, video_size: Optional[VideoSize] = None
     ) -> torch.Tensor:
         # [B S H D]
-        additional_args = {}
         assert video_size is not None
-        mask = self._make_block_causal_mask(video_size.H, video_size.W, q.shape[1], k.shape[1], q.device)
-        additional_args['attn_mask'] = mask
-        
+        k_length, q_length = k.shape[1], q.shape[1]
+        assert k_length >= q_length, f"got {k_length} < {q_length}"
+        mask = _make_block_causal_mask(video_size.H, video_size.W, q_length, k_length, q.device)
+
         with torch.autocast("cuda", enabled=False):
-            result = self.attn_op(q.float(), k.float(), v.float(), **additional_args)  # [B, S, H, D]
+            result = torch_attention_op(q.float(), k.float(), v.float(), attn_mask=mask)  # [B, S, H, D]
         return self.output_dropout(self.output_proj(result))
-    
-
-    def _make_block_causal_mask(self, h: int, w: int, q_seq_len, k_seq_len, device):
-        frame_numel = h * w
-        assert (q_seq_len % frame_numel == 0) and (k_seq_len % frame_numel == 0), \
-        f"got {q_seq_len} or {k_seq_len} % {frame_numel} != 0"
-
-        num_frames_q = q_seq_len // frame_numel
-        # block diagonal:
-        block_diag = torch.ones((frame_numel, frame_numel), dtype=torch.bool, device=device)
-        block_diag = torch.block_diag(*([block_diag] * num_frames_q))
-        
-        # lower triangular:
-        tril = torch.tril(torch.ones((q_seq_len, q_seq_len), dtype=torch.bool, device=device))
-
-        block_tril_mask = torch.logical_or(tril, block_diag)
-
-        if k_seq_len != q_seq_len:
-            assert k_seq_len > q_seq_len, f"Got keys dim={k_seq_len} < query dim = {q_seq_len}"
-            history_mask = torch.ones(q_seq_len, k_seq_len-q_seq_len, device=device, dtype=torch.bool)
-            block_tril_mask = torch.cat([history_mask, block_tril_mask], dim=1)
-        
-        return rearrange(block_tril_mask, "L S -> 1 1 L S")
 
     def forward(
         self,
@@ -339,8 +427,8 @@ class Attention(nn.Module):
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
         video_size: Optional[VideoSize] = None,
-        kv_cache: Optional[KVCache] = None
-    ) -> tuple[torch.Tensor, KVCache]:
+        kv_cache: Optional[LayerKVCache] = None
+    ) -> tuple[torch.Tensor, LayerKVCache]:
         """
         Args:
             x (Tensor): The query tensor of shape [B, Mq, K]
@@ -349,16 +437,8 @@ class Attention(nn.Module):
             video_size(VideoSize): Shape [T, H, W]
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        
-        if kv_cache is not None:
-            assert k.shape[2:] == kv_cache.keys.shape[2:], f"Shape mismatch {k.shape}, {kv_cache.keys.shape}"
-            assert v.shape[2:] == kv_cache.values.shape[2:], f"Shape mismatch {v.shape}, {kv_cache.values.shape}"
-            assert k.shape[0] == kv_cache.keys.shape[0]
-            assert v.shape[0] == kv_cache.values.shape[0]
-            k = torch.cat([kv_cache.keys, k], dim=1)
-            v = torch.cat([kv_cache.values, v], dim=1)
-
-        return self.compute_attention(q, k, v, video_size=video_size), KVCache(k, v)
+        new_kv_cache, k, v = _kv_cache_integration(k, v, video_size, kv_cache)
+        return self.compute_attention(q, k, v, video_size=video_size), new_kv_cache
 
 
 class VideoPositionEmb(nn.Module):
@@ -478,7 +558,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         w_spatial_freqs = 1.0 / (w_theta**self.dim_spatial_range)
         temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
 
-        
+
         assert (
             H <= self.max_h and W <= self.max_w
         ), f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
@@ -710,8 +790,8 @@ class PatchEmbed(nn.Module):
                 n=spatial_patch_size,
             ),
             nn.Linear(
-                in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size, 
-                out_channels, 
+                in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size,
+                out_channels,
                 bias=False
             ),
         )
@@ -756,9 +836,10 @@ class FinalLayer(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        spatial_patch_size: int,
-        temporal_patch_size: int,
-        out_channels: int,
+        disable_linear_projection: bool = True,
+        spatial_patch_size: int = None,
+        temporal_patch_size: int = None,
+        out_channels: int = None,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
         eps: float = 1e-5,
@@ -767,7 +848,7 @@ class FinalLayer(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=eps)
         self.linear = nn.Linear(
             hidden_size, spatial_patch_size * spatial_patch_size * temporal_patch_size * out_channels, bias=False
-        )
+        ) if not disable_linear_projection else None
         self.hidden_size = hidden_size
         self.n_adaln_chunks = 2
         self.use_adaln_lora = use_adaln_lora
@@ -787,7 +868,8 @@ class FinalLayer(nn.Module):
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self.hidden_size)
-        torch.nn.init.trunc_normal_(self.linear.weight, std=std, a=-3 * std, b=3 * std)
+        if self.linear is not None:
+            torch.nn.init.trunc_normal_(self.linear.weight, std=std, a=-3 * std, b=3 * std)
         if self.use_adaln_lora:
             torch.nn.init.trunc_normal_(self.adaln_modulation[1].weight, std=std, a=-3 * std, b=3 * std)
             torch.nn.init.zeros_(self.adaln_modulation[2].weight)
@@ -823,7 +905,10 @@ class FinalLayer(nn.Module):
             return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
 
         x_B_T_H_W_D = _fn(x_B_T_H_W_D, self.layer_norm, scale_B_T_1_1_D, shift_B_T_1_1_D)
-        x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
+        if self.linear is not None:
+            x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
+        else:
+            x_B_T_H_W_O = x_B_T_H_W_D
         return x_B_T_H_W_O
 
 
@@ -918,8 +1003,8 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
-    ) -> tuple[torch.Tensor, KVCache]:
+        kv_cache: Optional[LayerKVCache] = None,
+    ) -> tuple[torch.Tensor, LayerKVCache]:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
@@ -959,7 +1044,7 @@ class Block(nn.Module):
 
         video_size = VideoSize(T=T, H=H, W=W)
 
-        result_B_T_H_W_D, kv_cache = self.self_attn(
+        result_B_T_H_W_D, new_kv_cache = self.self_attn(
             # normalized_x_B_T_HW_D,
             rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
             None,
@@ -984,12 +1069,7 @@ class Block(nn.Module):
         )
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
-        return x_B_T_H_W_D, kv_cache
-    
-
-class ModelState:
-    def __init__(self, layers_kv_cache: List[KVCache]):
-        self.layers_kv_cache: List[KVCache] = layers_kv_cache
+        return x_B_T_H_W_D, new_kv_cache
 
 
 class MiniTrainDIT(nn.Module):
@@ -1110,6 +1190,7 @@ class MiniTrainDIT(nn.Module):
 
         self.final_layer = FinalLayer(
             hidden_size=self.model_channels,
+            disable_linear_projection=True,
             spatial_patch_size=self.patch_spatial,
             temporal_patch_size=self.patch_temporal,
             out_channels=self.out_channels,
@@ -1174,8 +1255,8 @@ class MiniTrainDIT(nn.Module):
 
     def prepare_embedded_sequence(
         self,
-        x_B_T_C_H_W: torch.Tensor,
-        state: Optional[ModelState] = None,
+        x_B_T_H_W_D: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Prepares an embedded sequence tensor by applying positional embeddings and handling padding masks.
@@ -1198,7 +1279,7 @@ class MiniTrainDIT(nn.Module):
             - Otherwise, the positional embeddings are generated without considering fps.
         """
         # Patchify:
-        x_B_T_H_W_D = self.x_embedder(x_B_T_C_H_W)
+        # x_B_T_H_W_D = self.x_embedder(x_B_T_C_H_W)
 
         if self.extra_per_block_abs_pos_emb:
             extra_pos_emb = self.extra_pos_embedder(x_B_T_H_W_D)
@@ -1206,10 +1287,10 @@ class MiniTrainDIT(nn.Module):
             extra_pos_emb = None
 
         offset = 0
-        if state is not None:
+        if kv_cache is not None:
             _, _, H, W, _ = x_B_T_H_W_D.shape
             frame_numel = H * W
-            offset = state.layers_kv_cache[0].keys.shape[1] // frame_numel
+            offset = kv_cache.layers_kv_caches[0].keys.shape[1]  # // frame_numel
         pos_embedder_out = self.pos_embedder(x_B_T_H_W_D, offset=offset)
         if "rope" in self.pos_emb_cls.lower():
             return x_B_T_H_W_D, pos_embedder_out, extra_pos_emb
@@ -1229,27 +1310,27 @@ class MiniTrainDIT(nn.Module):
 
     def forward(
         self,
-        x_B_T_C_H_W: torch.Tensor,
+        x_B_T_H_W_D: torch.Tensor,
         timesteps_B_T: torch.Tensor,
         condition_emb: torch.Tensor = None,
-        state: Optional[ModelState] = None,
-    ) -> tuple[torch.Tensor, ModelState] | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
+        kv_cache: Optional[KVCache] = None,
+    ) -> tuple[torch.Tensor, KVCache] | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
             x: (B, C, T, H, W) tensor of spatial-temp inputs
             timesteps: (B, T) tensor of timesteps
             condition_emb: (B, T, D) tensor of an additional conditioning signal
-            state: ModelState (optional) an object that contains per-layer KV caches of previous
+            kv_cache: ModelState (optional) an object that contains per-layer KV caches of previous
             inputs.
         """
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
-            x_B_T_C_H_W, state
+            x_B_T_H_W_D, kv_cache
         )
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
         t_embedding_B_T_D = self.t_embedder(timesteps_B_T)
-        
+
         c_B_T_D = t_embedding_B_T_D
         if condition_emb is not None:
             assert condition_emb.shape == t_embedding_B_T_D.shape, f"Got {condition_emb.shape}, {t_embedding_B_T_D.shape}"
@@ -1271,8 +1352,8 @@ class MiniTrainDIT(nn.Module):
         }
         block_kv_caches = []
         for i, block in enumerate(blocks):
-            if state is not None:
-                block_kwargs['kv_cache'] = state.layers_kv_cache[i]
+            if kv_cache is not None:
+                block_kwargs['kv_cache'] = kv_cache.layers_kv_caches[i]
 
             x_B_T_H_W_D, block_kv_cache = block(
                 x_B_T_H_W_D,
@@ -1282,9 +1363,10 @@ class MiniTrainDIT(nn.Module):
             block_kv_caches.append(block_kv_cache)
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, c_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
-        x_B_Tt_C_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
-        return x_B_Tt_C_Hp_Wp, ModelState(block_kv_caches)
-    
+        # x_B_Tt_C_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+        # return x_B_Tt_C_Hp_Wp, KVCache(block_kv_caches)
+        return x_B_T_H_W_O, KVCache(block_kv_caches)
+
 
 class DiT(nn.Module, Configurable):
     @dataclass(kw_only=True)
@@ -1333,10 +1415,10 @@ class DiT(nn.Module, Configurable):
             ln_eps=config.ln_eps,
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor, state: Optional[ModelState] = None):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor, kv_cache: Optional[KVCache] = None):
         return self.model.forward(
-            x_B_T_C_H_W=x,
+            x_B_T_H_W_D=x,
             timesteps_B_T=t,
             condition_emb=c,
-            state=state,
+            kv_cache=kv_cache,
         )

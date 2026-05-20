@@ -12,6 +12,6 @@ class EulerSampler(DiffusionSamplerBase):
         for _ in range(num_steps):
             t, dt = self.scheduler()
             # TODO: can be more efficient to only pass elements where dt > 0 
-            v_t = self.denoiser(x, t, **denoiser_kwargs)
+            v_t = self.denoiser(x, t=t, dt=dt, **denoiser_kwargs)
             x = x + v_t * dt
         return x
