@@ -270,7 +270,7 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
         actions, log_pi, denoising_times = denoiser.get_buffers()
 
         # Compute the policy given the final (clean) obs:
-        clean_actions, clean_log_pi = policy(segment_obs)
+        clean_actions, clean_log_pi = policy(segment_obs, is_clean=True)
         actions.append(clean_actions)
         log_pi.append(clean_log_pi)
 

@@ -133,9 +133,12 @@ class StablePolicyActionProducer(ActionProducer):
         self.actor_critic = actor_critic
         self.action_producer = StableDiscreteActionProducer()
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, is_clean=False, *args, **kwargs):
         # TODO: support actions - generate efficiently
-        action_dist, _, _ = self.actor_critic(prev_actions=None, obs=x, compute_critic=False)
+        if is_clean:
+            action_dist = self.actor_critic.clean_actor(prev_actions=None, obs=x, *args, **kwargs)
+        else:
+            action_dist, _, _ = self.actor_critic(prev_actions=None, obs=x, compute_critic=False, *args, **kwargs)
         a, log_prob_a = self.action_producer(action_dist)
         return a, log_prob_a
     
@@ -145,9 +148,12 @@ class NaivePolicyActionProducer(ActionProducer):
         super().__init__()
         self.actor_critic = actor_critic
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, is_clean=False, *args, **kwargs):
         # TODO: support actions - generate efficiently
-        action_dist, _, _ = self.actor_critic(prev_actions=None, obs=x, compute_critic=False)
+        if is_clean:
+            action_dist = self.actor_critic.clean_actor(prev_actions=None, obs=x, *args, **kwargs)
+        else:
+            action_dist, _, _ = self.actor_critic(prev_actions=None, obs=x, compute_critic=False, *args, **kwargs)
         a = action_dist.sample()
         log_prob_a = action_dist.log_prob(a)
         return a, log_prob_a

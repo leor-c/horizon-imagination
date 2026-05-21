@@ -18,6 +18,7 @@ def _get_actor_critic_cfg(
     # Config values only:
     latent_dim = 512
     shared_backbone = False
+    use_clean_diffused_actors = True
     ignore_actions = True  # TODO: support (previous) action inputs!
     cnn_base_channels = 256
     cnn_out_channels = 64
@@ -59,6 +60,7 @@ def _get_actor_critic_cfg(
     ac_cfg = ActorCritic.Config(
         backbone=backbone_cfg,
         shared_backbone=shared_backbone,
+        use_clean_diffused_actors=use_clean_diffused_actors,
         actor=DiscreteActorHead.Config(
             latent_dim=latent_dim,
             actor_bias=actor_bias,

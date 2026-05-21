@@ -1,6 +1,7 @@
 from typing import Literal
 import lightning as L
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 import gymnasium as gym
@@ -119,6 +120,110 @@ def make_valid_mask(ends, t):
     mask = torch.logical_and(mask.bool(), valid_denoising_masks.bool())
 
     return mask
+
+
+def compute_original_actor_loss(
+        traj_segment,
+        lambda_returns,
+        values,
+        returns_scale,
+        N,
+        B,
+        valid_mask,
+        action_dist,
+        actor_critic_outs
+):
+    log_probs = traj_segment['log_pi'][:, :-1]
+    advantage = (lambda_returns - values).detach() / returns_scale.to(dtype=values.dtype)
+    advantage = repeat(advantage, "B ... -> (N B) ...", N=N, B=B)
+    loss_actions = -(log_probs * advantage.detach())
+    # loss_actions = rearrange(loss_actions, '(N B) ... -> N B ...', N=N, B=B)
+    # loss_actions = loss_actions[-1][torch.where(valid_mask[-1])].mean()
+    loss_actions = loss_actions[torch.where(valid_mask)].mean()
+
+    loss_actor = loss_actions
+
+    entropy = torch.cat(
+        [
+            torch.cat([action_dist.entropy(), d.entropy()], dim=1)
+            for d in actor_critic_outs.actions_dist
+        ], dim=0
+    )[:, :-1]
+    entropy = entropy[torch.where(valid_mask)]
+    entropy = entropy.mean()
+
+    return loss_actor, entropy, advantage
+
+
+def compute_clean_diffused_actor_loss(
+        traj_segment,
+        lambda_returns,
+        values,
+        returns_scale,
+        N,
+        B,
+        valid_mask,
+        action_dist,
+        actor_critic_outs
+):
+    actions_logits = torch.stack(
+        [
+            torch.cat([action_dist.logits, d.logits], dim=1)
+            for d in actor_critic_outs.actions_dist
+        ], dim=0
+    )[:, :, :-1]
+
+    clean_log_probs = traj_segment['log_pi'][-1, :, :-1]
+    advantage = (lambda_returns - values).detach() / returns_scale.to(dtype=values.dtype)
+    # advantage = repeat(advantage, "B ... -> (N B) ...", N=N, B=B)
+    loss_actions = -(clean_log_probs * advantage.detach())
+    # loss_actions = rearrange(loss_actions, '(N B) ... -> N B ...', N=N, B=B)
+    # loss_actions = loss_actions[-1][torch.where(valid_mask[-1])].mean()
+    valid_mask_blocks = rearrange(valid_mask, '(N B) ... -> N B ...', N=N, B=B)
+    loss_actions = loss_actions[torch.where(valid_mask_blocks[-1])].mean()
+
+    noisy_action_logits = actions_logits[:-1]
+    clean_action_logits = actions_logits[-1]
+    targets = repeat(clean_action_logits.detach(), 'B T ... -> N B T ...', N=N - 1)
+    loss_noisy_actions = F.cross_entropy(
+        noisy_action_logits[torch.where(valid_mask_blocks[:-1])].flatten(0, 1),
+        F.softmax(targets[torch.where(valid_mask_blocks[:-1])].flatten(0, 1), dim=-1)
+        )
+
+    loss_actor = loss_actions + loss_noisy_actions
+
+    entropy = torch.stack(
+        [
+            torch.cat([action_dist.entropy(), d.entropy()], dim=1)
+            for d in actor_critic_outs.actions_dist
+        ], dim=0
+    )[-1, :, :-1]
+    entropy = entropy[torch.where(valid_mask_blocks[-1])]
+    entropy = entropy.mean()
+
+    return loss_actor, entropy, advantage
+
+
+def compute_actor_loss(
+        use_clean_diffused_actors: bool,
+        traj_segment,
+        lambda_returns,
+        values,
+        returns_scale,
+        N,
+        B,
+        valid_mask,
+        action_dist,
+        actor_critic_outs
+):
+    if use_clean_diffused_actors:
+        return compute_clean_diffused_actor_loss(
+            traj_segment, lambda_returns, values, returns_scale, N, B, valid_mask, action_dist, actor_critic_outs
+        )
+    else:
+        return compute_original_actor_loss(
+            traj_segment, lambda_returns, values, returns_scale, N, B, valid_mask, action_dist, actor_critic_outs
+        )
 
 
 class Controller(L.LightningModule, Configurable):
@@ -266,7 +371,7 @@ class Controller(L.LightningModule, Configurable):
                 # at the last iteration:
                 obs = prepare_obs(self._last_obs)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    action_dist, _, _ = self.actor_critic.forward(action, obs, advance_state=True, compute_critic=False)
+                    action_dist = self.actor_critic.clean_actor(action, obs, advance_state=True)
                 action = action_dist.sample()
             
             if pbar_update_fn is not None:
@@ -299,7 +404,7 @@ class Controller(L.LightningModule, Configurable):
                 # compute action:
                 obs = prepare_obs(last_obs)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    action_dist, _, _ = self.actor_critic.forward(action, obs, advance_state=True, compute_critic=False)
+                    action_dist = self.actor_critic.clean_actor(action, obs, advance_state=True)
                 action = action_dist.sample()
 
                 # perform env step:
@@ -367,7 +472,19 @@ class Controller(L.LightningModule, Configurable):
         first_step_outs = (action_dist, first_action_log_p, value, v_logits)
 
         # set wm context:
-        wm_context = batch[torch.arange(pad_mask.shape[0]), pad_mask.sum(1)-1][:, None]
+        # take last K valid positions per row
+        K = 1
+        if K == 1:
+            wm_context = batch[torch.arange(pad_mask.shape[0]), pad_mask.sum(1) - 1][:, None]
+        else:
+            B = pad_mask.shape[0]
+
+            last = pad_mask.sum(1) - 1  # [B]
+            offsets = torch.arange(K - 1, -1, -1, device=last.device)  # [K], e.g. [3,2,1,0]
+            idx = last[:, None] - offsets[None, :]  # [B, K]
+            idx = idx.clamp_min(0)  # optional safety
+
+            wm_context = batch[torch.arange(B, device=last.device)[:, None], idx]  # [B, K, ...]
         wm_context['action'][:, -1:] = first_action
 
         # generate imagined data:
@@ -416,22 +533,10 @@ class Controller(L.LightningModule, Configurable):
 
         values = actor_critic_outs.values[:, :-1]
 
-        log_probs = traj_segment['log_pi'][:, :-1]
-        advantage = (lambda_returns - values).detach() / returns_scale.to(dtype=values.dtype)
-        advantage = repeat(advantage, "B ... -> (N B) ...", N=N, B=B)
-        loss_actions = -(log_probs * advantage.detach())
-        # loss_actions = rearrange(loss_actions, '(N B) ... -> N B ...', N=N, B=B)
-        # loss_actions = loss_actions[-1][torch.where(valid_mask[-1])].mean()
-        loss_actions = loss_actions[torch.where(valid_mask)].mean()
-
-        loss_actor = loss_actions
-        
-        entropy = torch.cat([
-            torch.cat([action_dist.entropy(), d.entropy()], dim=1) 
-            for d in actor_critic_outs.actions_dist
-        ], dim=0)[:, :-1]
-        entropy = entropy[torch.where(valid_mask)]
-        entropy = entropy.mean()
+        loss_actor, entropy, advantage = compute_actor_loss(
+            self.config.actor_critic.use_clean_diffused_actors,
+            traj_segment, lambda_returns, values, returns_scale, N, B, valid_mask, action_dist, actor_critic_outs
+        )
         loss_entropy = - self.config.entropy_weight * entropy
 
         valid_mask = rearrange(valid_mask, '(N B) ... -> N B ...', N=N, B=B)
@@ -488,7 +593,10 @@ class Controller(L.LightningModule, Configurable):
             torch.cat([first_action_log_p, log_pi_i], dim=1) 
             for log_pi_i in traj_segment['log_pi']
         ]
-        traj_segment['log_pi'] = torch.cat(traj_segment['log_pi'], dim=0)
+        if self.config.actor_critic.use_clean_diffused_actors:
+            traj_segment['log_pi'] = torch.stack(traj_segment['log_pi'], dim=0)
+        else:
+            traj_segment['log_pi'] = torch.cat(traj_segment['log_pi'], dim=0)
 
         # Optimize only for the final rewards & terminations:
         traj_segment['reward'] = traj_segment['reward']

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -102,6 +102,7 @@ class ActorCritic(nn.Module, Configurable):
     class Config(BaseConfig):
         backbone: LightweightSeqModel.Config
         shared_backbone: bool
+        use_clean_diffused_actors: bool
         actor: ActorHead.Config
         critic: CriticHead.Config
 
@@ -129,6 +130,12 @@ class ActorCritic(nn.Module, Configurable):
         self.actor: ActorHead = config.actor.make_instance()
         self.critic: CriticHead = config.critic.make_instance()
 
+        self.clean_actor_backbone = self.actor_backbone
+        self.clean_actor_head = self.actor
+        if self.config.use_clean_diffused_actors:
+            self.clean_actor_backbone = config.backbone.make_instance()
+            self.clean_actor_head: ActorHead = config.actor.make_instance()
+
         self.outputs_buffer = None
 
     def reset(
@@ -141,10 +148,10 @@ class ActorCritic(nn.Module, Configurable):
                 self.critic_state = None
             return
 
-        x, self.actor_state = self.actor_backbone(
+        x, self.actor_state = self.clean_actor_backbone(
             context_actions, context_obs, None, pad_mask
         )
-        last_action_dist = self.actor(x[:, -1:])
+        last_action_dist = self.clean_actor_head(x[:, -1:])
 
         if not self.config.shared_backbone:
             x, self.critic_state = self.critic_backbone(
@@ -241,6 +248,20 @@ class ActorCritic(nn.Module, Configurable):
         self._record_if_needed(action_dist, value, v_logits)
 
         return action_dist, value, v_logits
+
+    def clean_actor(
+        self,
+        prev_actions,
+        obs,
+        advance_state: bool = False,
+    ):
+        x, actor_state = self.clean_actor_backbone(prev_actions, obs, self.actor_state)
+        if advance_state:
+            self.actor_state = actor_state
+        action_dist = self.clean_actor_head(x)
+        self._record_if_needed(action_dist, None, None)
+        return action_dist
+
 
     def generate(self, last_action, obs, advance_state: bool = False):
         """
