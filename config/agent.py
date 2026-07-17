@@ -3,8 +3,10 @@ import gymnasium as gym
 import torch
 from pathlib import Path
 
+import episodata as ed
+from episodata.utils import schema_from_gym_spaces
+
 from horizon_imagination.agent import Agent
-from horizon_imagination.data import get_replay_buffer_storage
 from horizon_imagination.utilities.config import BaseConfig
 from config.tokenizer.image.cosmos import get_cosmos_tokenizer_online_config, CosmosImageTokenizer
 from config.world_model.flow_online import get_world_model_online_config, RectifiedFlowWorldModel
@@ -122,16 +124,16 @@ def get_agent_online_config(
         controller_weights_path
     )
 
+    replay_buffer = ed.Dataset.create(
+        schema=schema_from_gym_spaces(env.observation_space, env.action_space),
+        path=replay_buf_data_path,
+    )
+
     agent_cfg = Agent.Config(
         obs_space=observation_space,
         action_space=action_space,
         env=env,
-        replay_buffer_storage=get_replay_buffer_storage(
-            max_size=replay_buf_max_size,
-            store_on_disk=replay_buf_store_on_disk,
-            data_path=replay_buf_data_path,
-            device=replay_buf_device,
-        ),
+        replay_buffer=replay_buffer,
         image_tokenizer=tokenizer,
         world_model=world_model,
         controller=controller,

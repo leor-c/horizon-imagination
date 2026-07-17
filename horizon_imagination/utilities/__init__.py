@@ -6,6 +6,7 @@ from loguru import logger
 import contextlib
 
 from horizon_imagination.utilities.types import *
+from horizon_imagination.utilities.rolling_context_buffer import RollingContextBuffer, TensorDictRollingContextBuffer
 
 
 @dataclass
@@ -21,6 +22,10 @@ class MaskedMSELoss:
         self.mse_loss = nn.MSELoss()
 
     def __call__(self, x: Tensor, target: Tensor, mask: Tensor = None):
+        """
+        Assume mask is a boolean tensor with values of 1 for valid places and 0 for invalid places that should
+        not participate in the loss.
+        """
         if mask is None: 
             return self.mse_loss(x, target)
         

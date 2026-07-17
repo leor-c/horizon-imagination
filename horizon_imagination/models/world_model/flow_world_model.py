@@ -112,9 +112,8 @@ class DenoiserWithPolicyWrapper(DenoiserBase):
 
         kv_cache = self.denoiser_kv_cache
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            with torch.no_grad():
-                denoised, new_kv_cache = self.denoiser(x_, t_, actions=actions, kv_cache=kv_cache)
+        with torch.no_grad():
+            denoised, new_kv_cache = self.denoiser(x_, t_, actions=actions, kv_cache=kv_cache)
 
         out = torch.zeros_like(x)
         n_clean = (t_[0] == 1).sum()
@@ -166,17 +165,22 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
 
     @torch.no_grad()
     def get_obs_from_batch(self, batch: TensorDict) -> TensorDict:
-        obs = batch['observation']
+        obs = batch['all_observations']
         if self.obs_transform is not None:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                obs = self.obs_transform.transform(obs)
-        return obs.float()
+            obs = self.obs_transform.transform(obs).float()
+            batch['obs_latents'] = obs
+        return obs
 
     def training_step(self, batch, batch_idx, log_dict_fn = None):
         self.train()
-
         obs = self.get_obs_from_batch(batch)
-        mask = batch['mask'] if 'mask' in batch else None
+        # batch['mask'] marks *transition* validity. Thus, the mask value of the terminal obs is False. We want to
+        # include it:
+        if 'mask' in batch:
+            # we assume the batch follows the "action-out" convention (action, reward, termination that followed from
+            # the obs at that index)
+            mask = torch.logical_or(batch['mask'], shift_fwd(batch['terminated']))
+        else: mask = None
 
         # It makes more sense to look at (action, obs) blocks!
         shifted_action = shift_fwd(batch['action'])
@@ -226,6 +230,9 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
             context: TensorDict = None, 
             context_noise_level: float = 0.05,
         ):
+        """
+        Assume context follows an action-out convention: action[i] is the action taken at obs[i]
+        """
         self.eval()
 
         device = self.config.denoiser_config.device
@@ -234,7 +241,10 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
         # compute state from context:
         rd_state = None
         if context is not None:
-            ctx_obs = self.get_obs_from_batch(context)
+            if 'obs_latents' not in context:
+                context['obs_latents'] = self.get_obs_from_batch(context)
+
+            ctx_obs = context['obs_latents']
             ctx_actions = context['action']
             _, _, rd_state = self.reward_done_model(
                 shift_fwd(ctx_actions),

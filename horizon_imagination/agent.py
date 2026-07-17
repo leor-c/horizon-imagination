@@ -1,9 +1,10 @@
 from pathlib import Path
 import gymnasium as gym
+from episodata.utils import batch_to_tensordict
 from gymnasium.spaces import Dict, Space
 from gymnasium import Env
 import lightning as L
-from torchrl.data import Storage, RandomSampler, LazyMemmapStorage
+import episodata as ed
 from einops import rearrange
 import numpy as np
 import torch
@@ -12,10 +13,12 @@ import wandb
 import shutil
 from functools import partial
 
+from tensordict import TensorDict
+
 from horizon_imagination.data import (
-    get_replay_buffer, EpochDataIterator, ReplayBufferTrajectoryIterator,
-    SegmentSampler, get_segment_replay_buffer
+    EpochDataIterator
 )
+from horizon_imagination.data.replay_buffer import infinite_loader
 from horizon_imagination.models.tokenizer import CosmosImageTokenizer
 from horizon_imagination.models.world_model import RectifiedFlowWorldModel
 from horizon_imagination.models.controller import Controller
@@ -91,7 +94,7 @@ class Agent(Configurable, L.LightningModule):
         obs_space: Dict
         action_space: Space
         env: Env
-        replay_buffer_storage: Storage
+        replay_buffer: ed.Dataset
         image_tokenizer: CosmosImageTokenizer
         world_model: RectifiedFlowWorldModel
         controller: Controller
@@ -108,12 +111,7 @@ class Agent(Configurable, L.LightningModule):
 
         self.config = config
 
-        self.replay_buffer_storage = config.replay_buffer_storage
-        self.rb = get_replay_buffer(
-            self.replay_buffer_storage, 
-            RandomSampler(), 
-            batch_size=config.training.tokenizer_batch_size
-        )
+        self.rb = config.replay_buffer
 
         self.tokenizer: CosmosImageTokenizer = config.image_tokenizer
 
@@ -175,9 +173,6 @@ class Agent(Configurable, L.LightningModule):
             )
             # rich_pbar.progress.remove_task(task_id)
 
-            if isinstance(self.replay_buffer_storage, LazyMemmapStorage):
-                self.replay_buffer_storage.save(Path(self.replay_buffer_storage.scratch_dir))
-
         self.controller.train()
         self.tokenizer.train()
         self.world_model.train()
@@ -215,7 +210,7 @@ class Agent(Configurable, L.LightningModule):
         
         if self.epoch_data_iter is None:
             self.epoch_data_iter = EpochDataIterator.Config(
-                rb_storage=self.replay_buffer_storage,
+                replay_buffer=self.rb,
                 tokenizer_steps=tokenizer_steps,
                 world_model_steps=world_model_steps,
                 controller_steps=controller_steps,
@@ -256,28 +251,22 @@ class Agent(Configurable, L.LightningModule):
     def val_dataloader(self):
         eval_batch_size = 8
 
-        if self.val_rb is None:
-            self.val_rb = get_segment_replay_buffer(
-                self.replay_buffer_storage,
-                rb_sampler=SegmentSampler(
-                    segment_len=self.config.training.world_model_horizon,
-                    min_length=self.config.training.world_model_horizon,
-                    traj_key='episode',
-                    pad_direction='suffix',
-                    uniform_prob=0.7
-                ),
-                batch_size=eval_batch_size * self.config.training.world_model_horizon
-            )
-
-        data_iterator = ReplayBufferTrajectoryIterator(
-            rb=self.val_rb,
-            segments_per_batch=eval_batch_size,
-            steps_per_segment=self.config.training.world_model_horizon,
+        # if self.val_rb is None:
+        segments = self.config.replay_buffer.segments(sequence_length=self.config.training.world_model_horizon)
+        self.val_rb = torch.utils.data.DataLoader(
+            dataset=segments,
+            batch_size=eval_batch_size,
+            shuffle=True,
+            collate_fn=segments.collate,
+            # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
         )
+
+        data_iterator = infinite_loader(self.val_rb)
         return data_iterator
     
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
+        batch = batch_to_tensordict(batch, device='cuda', include_all_observations=True)
         self._generate_validation_videos(batch)
 
         is_controller_learning = not (
@@ -305,10 +294,11 @@ class Agent(Configurable, L.LightningModule):
         batch_size = batch.shape[0]
 
         context_actions = shift_fwd(batch['action'][:, :context_length])
-        context_obs = self.world_model.get_obs_from_batch(batch[:, :context_length])
+        context_obs = TensorDict(self.world_model.get_obs_from_batch(batch), batch_size=[batch_size, segment_length+1])[:, :context_length]
         pad_mask = batch['mask']
 
-        np_ctx = rearrange(batch[:, :context_length]['observation'][img_key].clone(), 'b t c h w -> b t h w c').cpu().numpy()
+        obs = TensorDict(batch['observation'], batch_size=[batch_size, segment_length])
+        np_ctx = rearrange(obs[:, :context_length][img_key].clone(), 'b t c h w -> b t h w c').cpu().numpy()
         np_ctx = make_border(np_ctx, width=3, color=(100, 100, 250))
         predictions = []
         
@@ -341,7 +331,11 @@ class Agent(Configurable, L.LightningModule):
 
         actions = batch['action'][:, context_length:]
         
-        context = batch[:, :context_length]
+        # context = batch[:, :context_length]
+        context = {
+            'obs_latents': context_obs,
+            'action': batch['action'][:, :context_length],
+        }
         for action_producer in action_producers:
             action_dist, value, v_logits = self.controller.actor_critic.reset(context_actions, context_obs)
             first_action = action_dist.sample()
@@ -370,9 +364,9 @@ class Agent(Configurable, L.LightningModule):
             obs_hat = np.concatenate([np_ctx, obs_hat], axis=1)
             predictions.append(obs_hat)
 
-        ground_truth = rearrange(batch[:, context_length:]['observation'][img_key], 'b t c h w -> b t h w c').cpu().numpy()
+        ground_truth = rearrange(obs[:, context_length:][img_key], 'b t c h w -> b t h w c').cpu().numpy()
         ground_truth = np.concatenate([np_ctx, ground_truth], axis=1)
-        rec = self.tokenizer.forward(batch[:, context_length:]['observation'][img_key].flatten(0, 1))
+        rec = self.tokenizer.forward(obs[:, context_length:][img_key].flatten(0, 1))
         rec = rearrange(rec, '(b t) c h w -> b t h w c', b=batch_size).cpu().numpy()
         rec = np.concatenate([np_ctx, rec], axis=1)
 

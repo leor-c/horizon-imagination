@@ -36,6 +36,10 @@ class RectifiedFlow(DiffusionBase):
             mask: Tensor = None,
             **kwargs,
         ) -> Tensor:
+        """
+        :param mask: Assume mask is a boolean tensor with values of 1 for valid places and 0 for invalid places that
+         should not participate in the loss.
+        """
         t = self.time_sampler.sample(x_clean.shape[:time_dims], device=x_clean.device, dtype=x_clean.dtype)
         x_t, noise = self.get_noisy_samples(x_clean, t)
         

@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 import lightning as L
 import torch
 import torch.nn.functional as F
@@ -9,18 +9,16 @@ from tensordict.tensordict import TensorDict
 from loguru import logger
 from tqdm import tqdm
 
-from torchrl.data import ListStorage
+import episodata as ed
 
 from horizon_imagination.models.controller.actor_critic import ActorCritic, OutputsBuffer
 from horizon_imagination.models.controller.return_scaler import EMAScaler
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
-from horizon_imagination.utilities import AdamWConfig, shift_fwd, RawMultiModalObs
+from horizon_imagination.utilities import AdamWConfig, shift_fwd, RawMultiModalObs, TensorDictRollingContextBuffer
 from horizon_imagination.models.world_model import RectifiedFlowWorldModel
 from horizon_imagination.models.world_model.action_producer import (
     StablePolicyActionProducer, NaivePolicyActionProducer
 )
-from horizon_imagination.modules.transform import PerModalityTransform
-from horizon_imagination.data.replay_buffer import TensorDictReplayBuffer
 from horizon_imagination.data.statistics_collector import ExperienceStatisticsCollector
 
 
@@ -47,31 +45,6 @@ def _to_tensor_dict_obs(obs: RawMultiModalObs):
         {k: torch.from_numpy(v) for k, v in obs.items()},
     )
     return obs
-
-
-def _infer_current_episode_id(replay_buffer: TensorDictReplayBuffer, episode_key: str = 'episode'):
-    if len(replay_buffer) == 0:
-        return 0
-    
-    last_step = replay_buffer[-1]
-    last_step_ep = last_step[episode_key]
-    last_step_done = torch.logical_or(last_step['terminated'], last_step['truncated']).cpu().item()
-    if last_step_done:
-        return last_step_ep + 1
-    
-    return last_step_ep.cpu().item()
-
-
-def get_episode_suffix(
-        replay_buffer: TensorDictReplayBuffer, 
-        episode_id: int,
-        suffix_length: int, 
-        episode_key: str = 'episode'
-    ):
-    if len(replay_buffer.storage) == 0:
-        return None
-    episode = replay_buffer[torch.where(replay_buffer[:][episode_key] == episode_id)]
-    return episode[-suffix_length:]
 
 
 def make_valid_mask(ends, t):
@@ -255,12 +228,17 @@ class Controller(L.LightningModule, Configurable):
         self.stats_collector = ExperienceStatisticsCollector()
 
         self._last_obs = None
+        self._context_buffer = TensorDictRollingContextBuffer(
+            k=config.controller_context_length,
+            action_spec=self.action_space,
+        )
+        self._episode_id = None
 
     @torch.no_grad()
     def forward(
             self, 
             env: gym.Env, 
-            replay_buffer: TensorDictReplayBuffer, 
+            replay_buffer: ed.Dataset,
             num_steps: int, 
             log_dict_fn = None,
             pbar_update_fn = None
@@ -269,200 +247,136 @@ class Controller(L.LightningModule, Configurable):
         Inference - Collect data / act in a real env.
         """
         self.eval()
+        self.collect_data(
+            env,
+            replay_buffer,
+            num_steps,
+            self._context_buffer,
+            log_dict_fn,
+            pbar_update_fn,
+            self.stats_collector,
+        )
+
+    def collect_data(
+            self,
+            env: gym.Env,
+            replay_buffer: ed.Dataset,
+            num_steps: int,
+            rolling_context_buffer: Optional[TensorDictRollingContextBuffer],
+            log_dict_fn=None,
+            pbar_update_fn=None,
+            stats_collector=None,
+        ):
         if num_steps <= 0:
             return
-        
-        episode_id = _infer_current_episode_id(replay_buffer)
-        if isinstance(episode_id, int):
-            episode_id = torch.tensor(episode_id)
 
         def prepare_obs(x):
             x = x.to(device=self._device)
             # add batch dim and encode if necessary:
-            return self.config.world_model.get_obs_from_batch({'observation': x[None, None]})
+            return self.config.world_model.get_obs_from_batch({'all_observations': x[None, None]})
+
+        def perform_episode_reset():
+            obs, info = env.reset()
+            td_obs = _to_tensor_dict_obs(obs)
+            td_obs_latent = prepare_obs(td_obs)[0, 0]
+
+            # update the rolling context buffer:
+            if rolling_context_buffer is not None:
+                rolling_context_buffer.reset(td_obs_latent)
+                context_actions, context_obs = rolling_context_buffer.get_context()
+
+            # add experience to the replay buffer:
+            writer = replay_buffer.new_episode(obs, None)
+            self._episode_id = writer.episode_id
+
+            return context_actions, context_obs, writer
 
         # Set up the context:
-        context = get_episode_suffix(replay_buffer, episode_id, self.config.controller_context_length)
-        if context is None or len(context) == 0:
-            """
-            in this case, either no previous experience exists,
-            or the last step was also a terminal step.
-            In both cases, we need to start a new episode:
-            """
-            # New episode, get first obs and set it as context:
-            if self._last_obs is None:
-                # Otherwise, an env reset has already been performed.
-                obs, info = env.reset()
-                self._last_obs = _to_tensor_dict_obs(obs)
-            context_obs = prepare_obs(self._last_obs)
-            # Dummy action (before first obs), will be ignored:
-            action_shape = self.action_space.shape
-            if len(action_shape) == 0:
-                action_shape = (1,)
-            size = (1, *action_shape)
-            context_actions = torch.zeros(*size, device=self._device).long()
-            pad_mask = None
-        else:
-            """
-            Last obs must exist (this must be a step in the middle of an episode). 
-            Instead of shifting action forward, shift obs backwards and place the 
-            last obs in front (last).
-            """
-            assert self._last_obs is not None, f"Got {self._last_obs}"
-            context = context[None].to(device=self._device)  # add batch dim
-            context_actions = context['action']
-            context['observation'] = torch.cat(
-                [context['observation'][:, 1:], self._last_obs[None, None].to(device=self._device)], 
-                dim=1
-            )
-            context_obs = self.config.world_model.get_obs_from_batch(context)
-            pad_mask = context['mask'] if 'mask' in context else None
+        if rolling_context_buffer is not None:
+            context = rolling_context_buffer.get_context()
+            if context is None:
+                """
+                in this case, no previous experience exists:
+                """
+                # New episode, get first obs and set it as context:
+                assert self._episode_id is None
+                context_actions, context_obs, writer = perform_episode_reset()
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            action_dist, _, _ = self.actor_critic.reset(context_actions, context_obs, pad_mask)
-        action = action_dist.sample()
+            else:
+                context_actions, context_obs = context
+                assert self._episode_id is not None, f"Episode id not set: {self._episode_id}"
+                writer = replay_buffer.episode(self._episode_id).writer()
+        else:
+            context_actions, context_obs, writer = perform_episode_reset()
 
         # Collect the data:
         for i in tqdm(range(num_steps), leave=False, desc="Data Collection"):
+            # Compute the action with the policy:
+            if i == 0:
+                action_dist, _, _ = self.actor_critic.reset(context_actions[None], context_obs[None])
+            else:
+                action_dist = self.actor_critic.clean_actor(action, td_obs_latent, advance_state=True)
+            action = action_dist.sample()
+
+            # Step the environment:
             action_raw = action.item() if action.numel() == 1 else action.cpu().numpy()
             obs, reward, terminated, truncated, info = env.step(action_raw)
-            rb_device = replay_buffer.storage.device
-            step = TensorDict({
-                'observation': TensorDict({str(k): v for k, v in self._last_obs.items()}, 
-                                          batch_size=self._last_obs.batch_size, 
-                                          device=rb_device),
-                'action': action[0, 0].to(device=rb_device),
-                'reward': torch.tensor(reward, device=rb_device),
-                'terminated': torch.tensor(terminated, device=rb_device),
-                'truncated': torch.tensor(truncated, device=rb_device),
-                'episode': episode_id.clone().to(device=rb_device),
-            })
-            replay_buffer.add(step)
 
-            self.stats_collector.step(None, action_raw, reward, terminated, truncated, info)
+            # Update the replay buffer:
+            step = {
+                'observation': {str(k): v for k, v in obs.items()},
+                'action': action[0, 0].cpu().numpy(),
+                'reward': reward,
+                'terminated': terminated,
+                'truncated': truncated,
+                # 'info': info,
+            }
+            writer.add_step(step)
 
-            self._last_obs = _to_tensor_dict_obs(obs)
+            # Update the rolling context buffer:
+            td_obs = _to_tensor_dict_obs(obs)
+            td_obs_latent = prepare_obs(td_obs)
+            if rolling_context_buffer is not None:
+                rolling_context_buffer.add(action[0, 0], td_obs_latent[0, 0])
+
+            # Update stats:
+            if stats_collector is not None:
+                stats_collector.step(None, action_raw, reward, terminated, truncated, info)
 
             if terminated or truncated:
-                # log the last obs for reward / termination prediction:
-                # set dummy action / reward / etc
-                step = TensorDict({
-                    'observation': TensorDict({str(k): v for k, v in self._last_obs.items()}, 
-                                            batch_size=self._last_obs.batch_size, 
-                                            device=rb_device),
-                    'action': torch.zeros_like(action[0, 0]).to(device=rb_device),
-                    'reward': torch.tensor(0, device=rb_device),
-                    'terminated': torch.tensor(terminated, device=rb_device),
-                    'truncated': torch.tensor(truncated, device=rb_device),
-                    'episode': episode_id.clone().to(device=rb_device),
-                })
-                replay_buffer.add(step)
+                # perform env reset and update the replay buffer:
+                context_actions, context_obs, writer = perform_episode_reset()
+                action = context_actions[None, -1:]
+                td_obs_latent = context_obs[None, -1:]
 
                 # reset the actor-critic state:
                 self.actor_critic.reset()
-
-                # reset the env and start a new episode:
-                episode_id += 1
-                obs, info = env.reset()
-                self._last_obs = _to_tensor_dict_obs(obs)
-
-            if i < num_steps - 1:
-                # Compute the action for the next step as long as we're not
-                # at the last iteration:
-                obs = prepare_obs(self._last_obs)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    action_dist = self.actor_critic.clean_actor(action, obs, advance_state=True)
-                action = action_dist.sample()
             
             if pbar_update_fn is not None:
                 pbar_update_fn()
         
         if log_dict_fn is None:
-            log_dict_fn = self.log_dict 
-        self.stats_collector.log_epoch_stats(log_dict_fn)
+            log_dict_fn = self.log_dict
+        if stats_collector is not None:
+            stats_collector.log_epoch_stats(log_dict_fn)
 
     @torch.no_grad()
     def collect_test_episodes(self, num_episodes: int, env: gym.Env, collect_stats_only: bool = True):
-        replay_buffer = TensorDictReplayBuffer(storage=ListStorage())
-        self.actor_critic.reset()
-
-        obs, info = env.reset()
-        last_obs = _to_tensor_dict_obs(obs)
-        action = torch.zeros(1, *self.action_space.sample().shape, device=self._device)
-        episode_id = torch.tensor(0)
-        episode_returns = []
-
-        def prepare_obs(x):
-            x = x.to(device=self._device)
-            # add batch dim and encode if necessary:
-            return self.config.world_model.get_obs_from_batch({'observation': x[None, None]})
-
-        for i in tqdm(range(num_episodes), leave=False, desc="Test Episodes Collection"):
-            done = False
-            episode_return = 0
-            while not done:
-                # compute action:
-                obs = prepare_obs(last_obs)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    action_dist = self.actor_critic.clean_actor(action, obs, advance_state=True)
-                action = action_dist.sample()
-
-                # perform env step:
-                action_raw = action.item() if action.numel() == 1 else action.cpu().numpy()
-                obs, reward, terminated, truncated, info = env.step(action_raw)
-
-                # store interaction:
-                rb_device = replay_buffer.storage.device
-                if not collect_stats_only:
-                    step = TensorDict({
-                        'observation': TensorDict({str(k): v for k, v in last_obs.items()}, 
-                                                batch_size=last_obs.batch_size, 
-                                                device=rb_device),
-                        'action': action[0, 0].to(device=rb_device),
-                        'reward': torch.tensor(reward, device=rb_device),
-                        'terminated': torch.tensor(terminated, device=rb_device),
-                        'truncated': torch.tensor(truncated, device=rb_device),
-                        'episode': episode_id.clone().to(device=rb_device),
-                    })
-                    replay_buffer.add(step)
-                episode_return += reward
-
-                last_obs = _to_tensor_dict_obs(obs)
-
-                if terminated or truncated:
-                    # log the last obs for reward / termination prediction:
-                    # set dummy action / reward / etc
-                    if not collect_stats_only:
-                        step = TensorDict({
-                            'observation': TensorDict({str(k): v for k, v in last_obs.items()}, 
-                                                    batch_size=last_obs.batch_size, 
-                                                    device=rb_device),
-                            'action': torch.zeros_like(action[0, 0]).to(device=rb_device),
-                            'reward': torch.tensor(0, device=rb_device),
-                            'terminated': torch.tensor(terminated, device=rb_device),
-                            'truncated': torch.tensor(truncated, device=rb_device),
-                            'episode': episode_id.clone().to(device=rb_device),
-                        })
-                        replay_buffer.add(step)
-
-                    # reset the actor-critic state:
-                    self.actor_critic.reset()
-
-                    # reset the env and start a new episode:
-                    episode_id += 1
-                    obs, info = env.reset()
-                    last_obs = _to_tensor_dict_obs(obs)
-
-                    done = True
-            episode_returns.append(episode_return)
-
-        return replay_buffer, episode_returns
+        # self.eval()
+        # init a replay buffer. need to get a schema.
+        # self.collect_data(
+        #     env,
+        #     replay_buffer,
+        #     num_steps,
+        #     rolling_context_buffer=None,
+        # )
+        raise NotImplementedError("Not implemented")
 
     def training_step(self, batch, batch_idx, log_dict_fn = None):
         # Assume suffix batch padding and prefix segment sampling.
         world_model = self.config.world_model
 
-        # set actor critc context:
+        # set actor critic context:
         context_actions = shift_fwd(batch['action'])
         context_obs = world_model.get_obs_from_batch(batch)
         pad_mask = batch['mask']
@@ -473,12 +387,11 @@ class Controller(L.LightningModule, Configurable):
 
         # set wm context:
         # take last K valid positions per row
+        B = pad_mask.shape[0]
         K = 1
         if K == 1:
             wm_context = batch[torch.arange(pad_mask.shape[0]), pad_mask.sum(1) - 1][:, None]
         else:
-            B = pad_mask.shape[0]
-
             last = pad_mask.sum(1) - 1  # [B]
             offsets = torch.arange(K - 1, -1, -1, device=last.device)  # [K], e.g. [3,2,1,0]
             idx = last[:, None] - offsets[None, :]  # [B, K]

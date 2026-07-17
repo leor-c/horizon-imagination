@@ -2,6 +2,8 @@ from typing import Tuple
 import gymnasium as gym
 import numpy as np
 from PIL import Image
+from gymnasium import Env
+from gymnasium.core import ObsType, ActType
 
 from horizon_imagination.utilities.types import ObsKey, Modality, MultiModalObs
 
@@ -56,6 +58,18 @@ class ModalityDictObsWrapper(gym.ObservationWrapper):
 
 
 class ImageChannelsFirst(gym.ObservationWrapper):
+
+    def __init__(self, env: Env[ObsType, ActType]):
+        super().__init__(env)
+
+        assert isinstance(self.observation_space, gym.spaces.Box)
+
+        self.observation_space = gym.spaces.Box(
+            low=np.transpose(self.observation_space.low, (2, 0, 1)),
+            high=np.transpose(self.observation_space.high, (2, 0, 1)),
+            dtype=self.observation_space.dtype,
+        )
+
     def observation(self, observation):
         assert isinstance(observation, np.ndarray)
         assert observation.shape[-1] == 3, f"Got shape {observation.shape}"

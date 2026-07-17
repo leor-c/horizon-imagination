@@ -35,7 +35,7 @@ class DiscreteActionEmbedder(nn.Module):
     def forward(self, actions: Tensor, t: Tensor) -> Tensor:
         assert torch.all(0 <= t) and torch.all(t <= 1)
         one_hots = F.one_hot(actions, num_classes=self.num_actions)
-        uniform = torch.ones_like(one_hots) / self.num_actions
+        # uniform = torch.ones_like(one_hots) / self.num_actions
 
         assert t.shape == actions.shape, f"got {t.shape}, {actions.shape}"
         # noised_actions = t.unsqueeze(-1) * one_hots + (1 - t.unsqueeze(-1)) * uniform
