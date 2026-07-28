@@ -77,7 +77,7 @@ class DenoiserWithPolicyWrapper(DenoiserBase):
         self.denoising_times.append(t)
 
         # the last step is used for critic value estimation (only).
-        actions, log_pi = self.action_producer(x)
+        actions, log_pi = self.action_producer(x, t=t)
 
         self.actions_buffer.append(actions)
         self.log_pi_buffer.append(log_pi)

@@ -6,6 +6,7 @@ import gymnasium as gym
 
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.modules.transform import PerModalityTransform
+from horizon_imagination.modules.embeddings import NoiseLevelEmbedding
 
 
 class LightweightSeqModel(nn.Module, Configurable):
@@ -23,6 +24,7 @@ class LightweightSeqModel(nn.Module, Configurable):
         latent_dim: int
         num_layers: int = 1
         ignore_actions: bool = False
+        condition_on_noise_level: bool = False
         device: torch.device = None
         dtype: torch.dtype = None
 
@@ -34,6 +36,12 @@ class LightweightSeqModel(nn.Module, Configurable):
 
         self.action_emb = self._build_action_emb()
         self.obs_transform = config.obs_vectorize_transforms
+
+        self.noise_embedder = None
+        if config.condition_on_noise_level:
+            self.noise_embedder = NoiseLevelEmbedding(
+                config.latent_dim, device=config.device, dtype=config.dtype
+            )
 
     def _build_model(self):
         return nn.LSTM(
@@ -60,10 +68,14 @@ class LightweightSeqModel(nn.Module, Configurable):
         obs: TensorDict,
         state: tuple[Tensor, Tensor] = None,
         pad_mask: Tensor = None,
+        *,
+        noise_level: Tensor = None,
     ):
         x = self.obs_transform.transform(obs)
 
         if not self.config.ignore_actions:
+            assert noise_level is None, \
+                "noise-level conditioning is only supported with ignore_actions=True"
             # If actions[i, j] = a_t  ==> obs[i, j] = o_{t+1} is the observation resulted from a_t
             assert actions.dim() == 2, f"Got {actions.shape}"
             actions = self.action_emb(actions)  # (b t d)
@@ -72,6 +84,11 @@ class LightweightSeqModel(nn.Module, Configurable):
             c = 2
         else:
             x = torch.stack([*list(x.values())], dim=-1).sum(dim=-1)
+            if self.config.condition_on_noise_level:
+                assert noise_level is not None
+                x = x + self.noise_embedder(noise_level)
+            else:
+                assert noise_level is None
             c = 1
 
         if pad_mask is not None:

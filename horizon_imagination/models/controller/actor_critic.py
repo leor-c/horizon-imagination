@@ -111,7 +111,9 @@ class ActorCritic(nn.Module, Configurable):
         self.config = config
         assert config.backbone.ignore_actions, f"Currently not support for actions..."
 
-        self.actor_backbone = config.backbone.make_instance()
+        actor_backbone_cfg = config.backbone.clone()
+        actor_backbone_cfg.condition_on_noise_level = True
+        self.actor_backbone = actor_backbone_cfg.make_instance()
         self.actor_state = None
 
         if not config.shared_backbone:
@@ -138,6 +140,19 @@ class ActorCritic(nn.Module, Configurable):
 
         self.outputs_buffer = None
 
+    def _clean_actor_noise_level(self, obs: TensorDict) -> Optional[Tensor]:
+        """
+        `clean_actor_backbone` only requires a noise-level input when it is
+        aliased to `actor_backbone` (use_clean_diffused_actors=False): that shared
+        network is also conditioned on noise level during noisy rollout steps, so
+        it needs the true (clean) t=1 value here to stay consistent. When it is a
+        dedicated backbone, it never sees noisy input and needs no time input at all.
+        """
+        if self.clean_actor_backbone is not self.actor_backbone:
+            return None
+        dtype = self.config.backbone.dtype or torch.float32
+        return torch.ones(obs.shape[:2], device=obs.device, dtype=dtype)
+
     def reset(
         self, context_actions = None, context_obs = None, pad_mask = None
     ) -> tuple[Distribution, Tensor, Tensor]:
@@ -149,7 +164,8 @@ class ActorCritic(nn.Module, Configurable):
             return
 
         x, self.actor_state = self.clean_actor_backbone(
-            context_actions, context_obs, None, pad_mask
+            context_actions, context_obs, None, pad_mask,
+            noise_level=self._clean_actor_noise_level(context_obs),
         )
         last_action_dist = self.clean_actor_head(x[:, -1:])
 
@@ -164,12 +180,13 @@ class ActorCritic(nn.Module, Configurable):
         return last_action_dist, last_value, last_v_logits
 
     def forward(
-        self, 
-        prev_actions, 
-        obs, 
-        advance_state: bool = False, 
+        self,
+        prev_actions,
+        obs,
+        advance_state: bool = False,
         compute_actor: bool = True,
         compute_critic: bool = True,
+        noise_level: Tensor = None,
     ) -> tuple[Distribution, Tensor, Tensor]:
         if not self.config.shared_backbone:
             return self._forward_separate_backbones(
@@ -178,6 +195,7 @@ class ActorCritic(nn.Module, Configurable):
                 advance_state=advance_state,
                 compute_actor=compute_actor,
                 compute_critic=compute_critic,
+                noise_level=noise_level,
             )
         else:
             return self._forward_shared_backbone(
@@ -186,19 +204,21 @@ class ActorCritic(nn.Module, Configurable):
                 advance_state=advance_state,
                 compute_actor=compute_actor,
                 compute_critic=compute_critic,
+                noise_level=noise_level,
             )
-        
+
     def _forward_shared_backbone(
         self,
-        prev_actions, 
-        obs, 
-        advance_state: bool = False, 
+        prev_actions,
+        obs,
+        advance_state: bool = False,
         compute_actor: bool = True,
         compute_critic: bool = True,
+        noise_level: Tensor = None,
     ):
         assert self.config.shared_backbone
 
-        x, actor_state = self.actor_backbone(prev_actions, obs, self.actor_state)
+        x, actor_state = self.actor_backbone(prev_actions, obs, self.actor_state, noise_level=noise_level)
 
         if compute_actor:
             action_dist = self.actor(x)
@@ -218,17 +238,18 @@ class ActorCritic(nn.Module, Configurable):
         return action_dist, value, v_logits
     
     def _forward_separate_backbones(
-        self, 
-        prev_actions, 
-        obs, 
-        advance_state: bool = False, 
+        self,
+        prev_actions,
+        obs,
+        advance_state: bool = False,
         compute_actor: bool = True,
         compute_critic: bool = True,
+        noise_level: Tensor = None,
     ):
         assert not self.config.shared_backbone
 
         if compute_actor:
-            x, actor_state = self.actor_backbone(prev_actions, obs, self.actor_state)
+            x, actor_state = self.actor_backbone(prev_actions, obs, self.actor_state, noise_level=noise_level)
             action_dist = self.actor(x)
         else:
             action_dist = None
@@ -255,7 +276,10 @@ class ActorCritic(nn.Module, Configurable):
         obs,
         advance_state: bool = False,
     ):
-        x, actor_state = self.clean_actor_backbone(prev_actions, obs, self.actor_state)
+        x, actor_state = self.clean_actor_backbone(
+            prev_actions, obs, self.actor_state,
+            noise_level=self._clean_actor_noise_level(obs),
+        )
         if advance_state:
             self.actor_state = actor_state
         action_dist = self.clean_actor_head(x)

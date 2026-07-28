@@ -14,12 +14,15 @@ class ActionProducer(ABC):
     """
 
     @abstractmethod
-    def __call__(self, x: TensorDict, *args, **kwargs) -> tuple[Tensor, Tensor]:
+    def __call__(self, x: TensorDict, *args, t: Tensor = None, **kwargs) -> tuple[Tensor, Tensor]:
         """
-        starting from the "reset state", predict and sample *actions* given x, 
+        starting from the "reset state", predict and sample *actions* given x,
         the "future" (noisy) trajectory segment.
         This method should restore the policy state after or before each method call.
         The user should not invoke 'reset' multiple times for the same context.
+
+        :param t: diffusion time (noise level) of x, shape (B, T). Only meaningful
+        (and required by the underlying noisy actor) when `is_clean` is False.
 
         Return: a tuple of (actions, log_probs)
         """
@@ -133,12 +136,14 @@ class StablePolicyActionProducer(ActionProducer):
         self.actor_critic = actor_critic
         self.action_producer = StableDiscreteActionProducer()
 
-    def __call__(self, x, is_clean=False, *args, **kwargs):
+    def __call__(self, x, is_clean=False, *args, t: Tensor = None, **kwargs):
         # TODO: support actions - generate efficiently
         if is_clean:
             action_dist = self.actor_critic.clean_actor(prev_actions=None, obs=x, *args, **kwargs)
         else:
-            action_dist, _, _ = self.actor_critic(prev_actions=None, obs=x, compute_critic=False, *args, **kwargs)
+            action_dist, _, _ = self.actor_critic(
+                prev_actions=None, obs=x, compute_critic=False, noise_level=t, *args, **kwargs
+            )
         a, log_prob_a = self.action_producer(action_dist)
         return a, log_prob_a
     
@@ -148,12 +153,14 @@ class NaivePolicyActionProducer(ActionProducer):
         super().__init__()
         self.actor_critic = actor_critic
 
-    def __call__(self, x, is_clean=False, *args, **kwargs):
+    def __call__(self, x, is_clean=False, *args, t: Tensor = None, **kwargs):
         # TODO: support actions - generate efficiently
         if is_clean:
             action_dist = self.actor_critic.clean_actor(prev_actions=None, obs=x, *args, **kwargs)
         else:
-            action_dist, _, _ = self.actor_critic(prev_actions=None, obs=x, compute_critic=False, *args, **kwargs)
+            action_dist, _, _ = self.actor_critic(
+                prev_actions=None, obs=x, compute_critic=False, noise_level=t, *args, **kwargs
+            )
         a = action_dist.sample()
         log_prob_a = action_dist.log_prob(a)
         return a, log_prob_a
