@@ -1,3 +1,5 @@
+from typing import Union
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -6,17 +8,18 @@ from tensordict.tensordict import TensorDict
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.modules.regression import RegressionHead
 from horizon_imagination.modules.lightweight_seq_model import LightweightSeqModel
+from horizon_imagination.modules.conv_seq_model import ConvSeqModel
 
 
 class RewardDoneModel(nn.Module, Configurable):
     @dataclass
     class Config(BaseConfig):
-        backbone_config: LightweightSeqModel.Config
+        backbone_config: Union[LightweightSeqModel.Config, ConvSeqModel.Config]
 
     def __init__(self, config: Config, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
-        self.backbone = LightweightSeqModel(config.backbone_config)
+        self.backbone = config.backbone_config.make_instance()
 
         latent_dim = config.backbone_config.latent_dim
         device = config.backbone_config.device

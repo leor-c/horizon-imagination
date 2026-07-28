@@ -11,6 +11,7 @@ from horizon_imagination.diffusion.samplers import (
 )
 from horizon_imagination.diffusion import HybridTimeSampler, UniformTimeSampler
 from horizon_imagination.modules.lightweight_seq_model import LightweightSeqModel
+from horizon_imagination.modules.conv_seq_model import ConvSeqModel
 from horizon_imagination.utilities.types import ObsKey, Modality
 from horizon_imagination.utilities import AdamWConfig
 from horizon_imagination.modules.transform import (
@@ -30,6 +31,7 @@ def get_world_model_online_config(
         decay_horizon: float,
         device,
         dtype,
+        reward_done_backbone: Literal['lstm', 'conv'] = 'lstm',
 ) -> RectifiedFlowWorldModel.Config:
     num_heads = 8
     head_dim = 64
@@ -67,8 +69,8 @@ def get_world_model_online_config(
     })
 
     # Reward & Termination model:
-    reward_done_cfg = RewardDoneModel.Config(
-        backbone_config=LightweightSeqModel.Config(
+    if reward_done_backbone == 'lstm':
+        backbone_cfg = LightweightSeqModel.Config(
             action_space=action_space,
             obs_vectorize_transforms=PerModalityTransform(
                 learned_per_modality_transforms={
@@ -89,7 +91,25 @@ def get_world_model_online_config(
             ignore_actions=True,
             device=device,
             dtype=dtype
-        ),
+        )
+    elif reward_done_backbone == 'conv':
+        backbone_cfg = ConvSeqModel.Config(
+            action_space=action_space,
+            in_channels=tokenizer_channels,
+            latent_spatial_shape=(8, 8),
+            base_channels=256,
+            cnn_out_channels=64,
+            num_blocks=2,
+            latent_dim=512,
+            ignore_actions=True,
+            device=device,
+            dtype=dtype
+        )
+    else:
+        raise ValueError(f"reward_done_backbone '{reward_done_backbone}' not supported.")
+
+    reward_done_cfg = RewardDoneModel.Config(
+        backbone_config=backbone_cfg,
     )
 
     if baseline == 'ar':
