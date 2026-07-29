@@ -38,6 +38,15 @@ class EpochDataIterator(Configurable):
     def __iter__(self):
         buffer = deque([])
 
+        # Zarr-backed segments pay a large fixed per-item overhead in
+        # zarr-python's sync-over-async read path (~1ms/item regardless of
+        # payload size), which single-process (num_workers=0) fetching pays
+        # serially for every item of every batch in the prefetch bursts
+        # below. Worker processes each pay that overhead independently but
+        # in parallel, which is what actually hides it.
+        num_workers = self.config.prefetch
+        worker_kwargs = dict(num_workers=num_workers, persistent_workers=num_workers > 0)
+
         segments_dataset = self.config.replay_buffer.segments(sequence_length=1, fields=['image|features'])
         if len(segments_dataset) == 0:
             return
@@ -47,6 +56,7 @@ class EpochDataIterator(Configurable):
             shuffle=True,
             collate_fn=segments_dataset.collate,
             # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
+            **worker_kwargs,
         )
         tokenizer_iter = infinite_loader(tokenizer_loader)
 
@@ -57,6 +67,7 @@ class EpochDataIterator(Configurable):
             shuffle=True,
             collate_fn=wm_segments.collate,
             # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
+            **worker_kwargs,
         )
         wm_iter = infinite_loader(wm_loader)
 
@@ -67,6 +78,7 @@ class EpochDataIterator(Configurable):
             shuffle=True,
             collate_fn=c_segments.collate,
             # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
+            **worker_kwargs,
         )
         c_iter = infinite_loader(c_loader)
 
