@@ -74,7 +74,7 @@ def get_agent_online_config(
     collection_steps_per_epoch = 200
     controller_test_frequency = 50
 
-    prefetch = 2
+    read_chunk_size = 4096
 
     # Init config instance:
     observation_space: gym.spaces.Dict = env.observation_space
@@ -155,7 +155,7 @@ def get_agent_online_config(
             collection_steps_per_epoch=collection_steps_per_epoch,
             controller_test_frequency=controller_test_frequency,
         ),
-        prefetch=prefetch,
+        read_chunk_size=read_chunk_size,
         test_env=test_env,
     )
 

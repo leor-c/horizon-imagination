@@ -101,7 +101,7 @@ class Agent(Configurable, L.LightningModule):
 
         training: TrainingConfig
 
-        prefetch: int = 2
+        read_chunk_size: int = 4096
 
         test_env: Env = None
 
@@ -221,7 +221,7 @@ class Agent(Configurable, L.LightningModule):
                 c_segment_length=self.controller.config.controller_context_length,
                 c_min_segment_length=1,
                 c_batch_size=self.controller.config.imagination_batch_size,
-                prefetch=self.config.prefetch
+                read_chunk_size=self.config.read_chunk_size,
             ).make_instance()
         else:
             self.epoch_data_iter.config.tokenizer_steps = tokenizer_steps

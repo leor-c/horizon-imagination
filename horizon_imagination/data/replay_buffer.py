@@ -1,6 +1,4 @@
 from typing import Literal
-import torch
-from torch.utils.data import DataLoader
 
 import episodata as ed
 from episodata.utils import batch_to_tensordict
@@ -11,7 +9,7 @@ from horizon_imagination.utilities.config import Configurable, BaseConfig, datac
 def infinite_loader(loader):
     while True:
         yield from loader
-    
+
 
 class EpochDataIterator(Configurable):
     @dataclass
@@ -27,7 +25,7 @@ class EpochDataIterator(Configurable):
         c_segment_length: int
         c_min_segment_length: int
         c_batch_size: int
-        prefetch: int = 2
+        read_chunk_size: int = 4096
         staleness_alpha: float = 3
         staleness_beta: float = 1
         uniform_prob: float = 0.7
@@ -38,43 +36,38 @@ class EpochDataIterator(Configurable):
     def __iter__(self):
         buffer = deque([])
 
-        segments_dataset = self.config.replay_buffer.segments(sequence_length=1, fields=['image|features'])
-        if len(segments_dataset) == 0:
-            return
-        tokenizer_loader = DataLoader(
-            dataset=segments_dataset,
+        # segment_stream() batches sampling+reads internally (see
+        # episodata.SegmentStream / read_chunk_size) instead of the
+        # DataLoader-per-item pattern this used to use, which is what makes
+        # this fast on a zarr-backed replay buffer.
+        tok_stream = self.config.replay_buffer.segment_stream(
+            sequence_length=1,
+            fields=['image|features'],
             batch_size=self.config.tokenizer_batch_size,
-            shuffle=True,
-            collate_fn=segments_dataset.collate,
+            read_chunk_size=self.config.read_chunk_size,
             # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
         )
-        tokenizer_iter = infinite_loader(tokenizer_loader)
-
-        wm_segments = self.config.replay_buffer.segments(sequence_length=self.config.wm_segment_length)
-        wm_loader = DataLoader(
-            dataset=wm_segments,
-            batch_size=self.config.wm_batch_size,
-            shuffle=True,
-            collate_fn=wm_segments.collate,
-            # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
-        )
-        wm_iter = infinite_loader(wm_loader)
-
-        c_segments = self.config.replay_buffer.segments(sequence_length=self.config.c_segment_length, pad='prefix')
-        c_loader = DataLoader(
-            dataset=c_segments,
-            batch_size=self.config.c_batch_size,
-            shuffle=True,
-            collate_fn=c_segments.collate,
-            # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
-        )
-        c_iter = infinite_loader(c_loader)
-
-        if len(tokenizer_loader) == 0:
+        if len(tok_stream.segments) == 0:
             return
+        tok_iter = iter(tok_stream)
+
+        wm_stream = self.config.replay_buffer.segment_stream(
+            sequence_length=self.config.wm_segment_length,
+            batch_size=self.config.wm_batch_size,
+            read_chunk_size=self.config.read_chunk_size,
+        )
+        wm_iter = iter(wm_stream)
+
+        c_stream = self.config.replay_buffer.segment_stream(
+            sequence_length=self.config.c_segment_length,
+            pad='prefix',
+            batch_size=self.config.c_batch_size,
+            read_chunk_size=self.config.read_chunk_size,
+        )
+        c_iter = iter(c_stream)
 
         def prefetch_tok():
-            batch = batch_to_tensordict(next(tokenizer_iter), device='cuda', include_all_observations=True)
+            batch = batch_to_tensordict(next(tok_iter), device='cuda', include_all_observations=True)
             batch = batch['observation']
             batch = batch['image|features'][:, 0]
             buffer.append(batch)
