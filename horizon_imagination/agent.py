@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 import gymnasium as gym
 from episodata.utils import batch_to_tensordict
@@ -164,6 +165,9 @@ class Agent(Configurable, L.LightningModule):
             #     rich_pbar.progress.update(task_id, advance=1)
             #     rich_pbar.refresh()
 
+            # NOTE(diagnostics): temporary timing to localize the between-epoch
+            # stall — remove once root-caused.
+            t0 = time.perf_counter()
             self.controller.forward(
                 env=self.config.env,
                 replay_buffer=self.rb,
@@ -171,6 +175,7 @@ class Agent(Configurable, L.LightningModule):
                 log_dict_fn=self.log_dict,
                 pbar_update_fn=None, #pbar_update
             )
+            logger.info(f"[on_train_epoch_start] data collection: {time.perf_counter() - t0:.3f}s")
             # rich_pbar.progress.remove_task(task_id)
 
         self.controller.train()
