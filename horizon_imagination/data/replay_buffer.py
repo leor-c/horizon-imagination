@@ -42,17 +42,25 @@ class EpochDataIterator(Configurable):
 
         # NOTE(diagnostics): temporary timing instrumentation to localize the
         # between-epoch stall on the zarr backend — remove once root-caused.
-        # persistent_workers is deliberately NOT used here: this DataLoader
-        # is rebuilt from scratch every epoch (required, since the replay
-        # buffer keeps growing with newly collected online episodes), and
-        # persistent workers are forked once and never see later refresh()
-        # calls, so they'd keep sampling a stale, frozen index — silently
-        # invisible to newly collected data. num_workers>0 without
-        # persistent_workers still parallelizes reads within one epoch's
-        # burst, just re-forked fresh each epoch.
+        #
+        # persistent_workers=True is safe here even though it's usually
+        # dangerous with a growing dataset: tokenizer_loader/wm_loader/
+        # c_loader are brand new local objects built fresh every __iter__
+        # call (every epoch), each wrapping a `segments()` snapshot taken
+        # at that same moment, so nothing ever survives across epochs to
+        # go stale. What persistent_workers actually fixes: *_steps_per_epoch
+        # (e.g. tokenizer_steps=300) is typically several times larger than
+        # one loader pass (segments // batch_size, e.g. ~57 for 1800
+        # segments / batch 32), so infinite_loader's `while True: yield from
+        # loader` restarts the same DataLoader ~5x within a single epoch.
+        # Without persistent_workers, torch spawns a fresh worker pool on
+        # every one of those restarts — paying full worker-startup cost
+        # (forking a process with a loaded model + CUDA context + wandb
+        # threads is not cheap) repeatedly per epoch, which was silently
+        # eating the read-parallelism gain num_workers was supposed to buy.
         t0 = time.perf_counter()
         num_workers = self.config.prefetch
-        worker_kwargs = dict(num_workers=num_workers)
+        worker_kwargs = dict(num_workers=num_workers, persistent_workers=num_workers > 0)
 
         segments_dataset = self.config.replay_buffer.segments(sequence_length=1, fields=['image|features'])
         if len(segments_dataset) == 0:
@@ -93,10 +101,20 @@ class EpochDataIterator(Configurable):
             return
 
         t_setup = time.perf_counter()
+
+        def _wraps(steps, loader):
+            n = len(loader)
+            return f"{steps / n:.2f}x" if n else "n/a"
+
         logger.info(
             f"[EpochDataIterator] dataset/loader setup: {t_setup - t0:.3f}s "
-            f"(tokenizer segments={len(segments_dataset)}, wm segments={len(wm_segments)}, "
-            f"c segments={len(c_segments)}, num_workers={num_workers})"
+            f"(tokenizer segments={len(segments_dataset)} batches/pass={len(tokenizer_loader)} "
+            f"wraps={_wraps(self.config.tokenizer_steps, tokenizer_loader)}; "
+            f"wm segments={len(wm_segments)} batches/pass={len(wm_loader)} "
+            f"wraps={_wraps(self.config.world_model_steps, wm_loader)}; "
+            f"c segments={len(c_segments)} batches/pass={len(c_loader)} "
+            f"wraps={_wraps(self.config.controller_steps, c_loader)}; "
+            f"num_workers={num_workers})"
         )
 
         def prefetch_tok():
