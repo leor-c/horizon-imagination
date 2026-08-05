@@ -26,13 +26,14 @@ def init_component(
 
 
 def get_agent_online_config(
-        env: gym.Env, 
+        env: gym.Env,
         env_name: str,
         replay_buf_data_path: Path = None,
         test_env: gym.Env = None,
         baseline: Literal['hi', 'ar', 'naive'] = 'hi',
         decay_horizon: float = 4,
         budget: int = 32,
+        resolution: int = 64,
     ):
     # Config values only (for readability):
     device = torch.device('cuda')
@@ -80,7 +81,7 @@ def get_agent_online_config(
     observation_space: gym.spaces.Dict = env.observation_space
     action_space: gym.spaces.Discrete = env.action_space
 
-    tokenizer_cfg = get_cosmos_tokenizer_online_config(dtype=dtype)
+    tokenizer_cfg = get_cosmos_tokenizer_online_config(dtype=dtype, resolution=resolution)
     tokenizer_channels = tokenizer_cfg.latent_channels
     
     tokenizer: CosmosImageTokenizer = init_component(
@@ -124,10 +125,18 @@ def get_agent_online_config(
         controller_weights_path
     )
 
-    replay_buffer = ed.Dataset.create(
-        schema=schema_from_gym_spaces(env.observation_space, env.action_space),
-        path=replay_buf_data_path,
+    schema = schema_from_gym_spaces(env.observation_space, env.action_space)
+    img_field = schema.fields.pop('image|features')
+    h, w = img_field.shape[-2:]
+    schema.fields['image|features_y'] = ed.FieldSpec(
+        key='image|features_y', shape=(1, h, w), dtype='uint8',
+        role='observation', low=0, high=255, layout='CHW',
     )
+    schema.fields['image|features_cbcr'] = ed.FieldSpec(
+        key='image|features_cbcr', shape=(2, h // 2, w // 2), dtype='uint8',
+        role='observation', low=0, high=255, layout='CHW',
+    )
+    replay_buffer = ed.Dataset.create(schema=schema, path=replay_buf_data_path)
 
     agent_cfg = Agent.Config(
         obs_space=observation_space,

@@ -24,6 +24,7 @@ from horizon_imagination.models.world_model import RectifiedFlowWorldModel
 from horizon_imagination.models.controller import Controller
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.utilities.types import ObsKey, Modality
+from horizon_imagination.utilities.obs_codec import ycbcr_to_rgb_obs
 from horizon_imagination.utilities.visualization import make_border, generate_video, to_img
 from horizon_imagination.utilities import shift_fwd
 from horizon_imagination.models.world_model.action_producer import (
@@ -298,6 +299,7 @@ class Agent(Configurable, L.LightningModule):
         pad_mask = batch['mask']
 
         obs = TensorDict(batch['observation'], batch_size=[batch_size, segment_length])
+        obs = ycbcr_to_rgb_obs(obs, drop_ycbcr=True)
         np_ctx = rearrange(obs[:, :context_length][img_key].clone(), 'b t c h w -> b t h w c').cpu().numpy()
         np_ctx = make_border(np_ctx, width=3, color=(100, 100, 250))
         predictions = []

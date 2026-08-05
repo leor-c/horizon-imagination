@@ -7,12 +7,22 @@ from horizon_imagination.models.tokenizer.cosmos import (
 ) 
 
 
-def get_cosmos_tokenizer_online_config(dtype):
+def get_cosmos_tokenizer_online_config(dtype, resolution: int = 64):
+    if resolution == 64:
+        channels_mult = (2, 4, 4)
+        spatial_compression = 8
+    elif resolution == 128:
+        channels_mult = (2, 4, 4, 4)
+        spatial_compression = 16
+    else:
+        raise ValueError(f"Unsupported resolution: {resolution}")
+
     network_cfg = ContinuousImageTokenizerConfig(
         attn_resolutions=tuple([16]),
         patch_size=1,  # 2
-        spatial_compression=8,
-        resolution=64,  # 128
+        channels_mult=channels_mult,
+        spatial_compression=spatial_compression,
+        resolution=resolution,
         channels=64,
         latent_channels=16,
         # formulation='VAE'

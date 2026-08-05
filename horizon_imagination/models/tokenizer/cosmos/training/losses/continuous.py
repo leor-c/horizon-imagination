@@ -25,6 +25,7 @@ from horizon_imagination.models.tokenizer.cosmos.modules.utils import batch2time
 from horizon_imagination.models.tokenizer.cosmos.training.datasets.utils import INPUT_KEY, LATENT_KEY, MASK_KEY, RECON_KEY
 from horizon_imagination.models.tokenizer.cosmos.training.losses import ReduceMode
 from horizon_imagination.models.tokenizer.cosmos.training.losses.lpips import LPIPS
+from horizon_imagination.utilities.ycbcr import YCbCrTensor
 
 _VALID_LOSS_NAMES = ["color", "perceptual", "flow", "kl", "video_consistency"]
 VIDEO_CONSISTENCY_LOSS = "video_consistency"
@@ -93,6 +94,23 @@ class ColorLoss(torch.nn.Module):
         if torch.isnan(color_weighted).any():
             raise ValueError("[COLOR] NaN detected in loss")
         return dict(color=color_weighted)
+
+
+class YCbCrColorLoss(torch.nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.schedule = WeightScheduler(boundaries=config.boundaries, values=config.values)
+
+    def forward(self, inputs, output_batch, iteration) -> dict[str, torch.Tensor]:
+        reconstructions = YCbCrTensor.from_rgb(output_batch[RECON_KEY])
+        targets = YCbCrTensor.from_rgb(inputs[INPUT_KEY])
+        y_loss = F.mse_loss(reconstructions.y, targets.y)
+        cb_loss = F.mse_loss(reconstructions.cb, targets.cb)
+        cr_loss = F.mse_loss(reconstructions.cr, targets.cr)
+        loss = y_loss + cb_loss + cr_loss
+        if torch.isnan(loss).any():
+            raise ValueError("[COLOR] NaN detected in loss")
+        return dict(color=loss)
 
 
 class KLLoss(torch.nn.Module):

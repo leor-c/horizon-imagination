@@ -17,6 +17,7 @@ from horizon_imagination.models.world_model.denoiser import DenoiserBase, VideoD
 from horizon_imagination.models.world_model.action_producer import ActionProducer
 from horizon_imagination.models.world_model.reward_done_model import RewardDoneModel
 from horizon_imagination.modules.transform import PerModalityTransform
+from horizon_imagination.utilities.obs_codec import ycbcr_to_rgb_obs
 
 
 class DenoiserWithPolicyWrapper(DenoiserBase):
@@ -166,6 +167,7 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
     @torch.no_grad()
     def get_obs_from_batch(self, batch: TensorDict) -> TensorDict:
         obs = batch['all_observations']
+        obs = ycbcr_to_rgb_obs(obs, drop_ycbcr=True)
         if self.obs_transform is not None:
             obs = self.obs_transform.transform(obs).float()
             batch['obs_latents'] = obs

@@ -14,9 +14,10 @@ from horizon_imagination.models.tokenizer.cosmos.training.configs.base.net impor
     ContinuousImageTokenizerConfig, DiscreteImageTokenizerConfig
 )
 from horizon_imagination.models.tokenizer.cosmos.training.configs.base.loss import ColorConfig, PerceptualConfig
-from horizon_imagination.models.tokenizer.cosmos.training.losses.continuous import ColorLoss, PerceptualLoss
+from horizon_imagination.models.tokenizer.cosmos.training.losses.continuous import ColorLoss, YCbCrColorLoss, PerceptualLoss
 from horizon_imagination.models.tokenizer.cosmos.training.metrics import PSNRMetric
 from horizon_imagination.models.tokenizer.cosmos.training.datasets.utils import INPUT_KEY, LATENT_KEY, MASK_KEY, RECON_KEY
+from horizon_imagination.utilities.ycbcr import YCbCrTensor
 
 
 class OptimizerConfig(BaseConfig):
@@ -54,7 +55,7 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
             assert isinstance(config.network_cfg, DiscreteImageTokenizerConfig)
             self.network = DiscreteImageTokenizer(**config.network_cfg.__dict__, dtype=config.precision)
 
-        self.color_loss = ColorLoss(ColorConfig())
+        self.color_loss = YCbCrColorLoss(ColorConfig())
         self.perceptual_loss = PerceptualLoss(PerceptualConfig())
         self.precision = config.precision
 
@@ -96,7 +97,7 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
 
         # log:
         losses = {f"tokenizer/{k}_loss": v.mean() for k, v in perceptual_loss.items()}
-        losses['tokenizer/color_loss'] = color_loss.mean()
+        losses['tokenizer/color_loss'] = color_loss
         if log_dict_fn is None:
             log_dict_fn = self.log_dict
         log_dict_fn(losses, prog_bar=True, on_epoch=True, on_step=False)
@@ -113,15 +114,19 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
         assert x.dtype == torch.uint8, f"got {x.dtype}"
         # Transform values from UInt8 to float in [-1, 1]
         assert x.dim() >= 4 and x.shape[-3] in [1, 3], f"got shape {x.shape}"
+        x = YCbCrTensor.from_rgb(x).get_virtual_tensor()
         x = x.to(dtype=self.precision) / 255
         x = x * 2 - 1
         return x
-    
+
     def _postprocess_images(self, x):
         # Reverse _preprocess_images:
-        # Transform values from float in [-1, 1] to UInt8 
+        # Transform values from float in [-1, 1] to UInt8
         x = (x.clamp(-1, 1) + 1) / 2
         x = x * 255
+        # only subsampled cb/cr from the original are used, matching what
+        # _preprocess_images fed the network (4:2:0 chroma subsampling).
+        x = YCbCrTensor(x[..., 0:1, :, :], x[..., 1:2, ::2, ::2], x[..., 2:3, ::2, ::2]).to_rgb()
         x = x.to(dtype=torch.uint8)
         return x
 

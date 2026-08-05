@@ -12,9 +12,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 def _make_dataset(path):
+    # Observations are stored as YCbCr (Y plane + a combined 2-channel CbCr
+    # plane, both CHW), not RGB -- matching the schema config/agent.py builds
+    # and what EpochDataIterator.prefetch_tok expects to
+    # read and reconstruct via get_rgb_tensor().
     schema = DatasetSchema(
         fields=[
-            FieldSpec("image|features", (4, 4, 3), "uint8", role="observation"),
+            FieldSpec("image|features_y", (1, 4, 4), "uint8", role="observation"),
+            FieldSpec("image|features_cbcr", (2, 2, 2), "uint8", role="observation"),
             FieldSpec("action", (), "int64", role="action"),
             FieldSpec("reward", (), "float32", role="reward"),
         ]
@@ -25,12 +30,16 @@ def _make_dataset(path):
         dataset.add_episode(
             {
                 "initial_observation": {
-                    "image|features": rng.integers(0, 255, size=(4, 4, 3), dtype=np.uint8)
+                    "image|features_y": rng.integers(0, 255, size=(1, 4, 4), dtype=np.uint8),
+                    "image|features_cbcr": rng.integers(0, 255, size=(2, 2, 2), dtype=np.uint8),
                 },
                 "observations": {
-                    "image|features": rng.integers(
-                        0, 255, size=(length, 4, 4, 3), dtype=np.uint8
-                    )
+                    "image|features_y": rng.integers(
+                        0, 255, size=(length, 1, 4, 4), dtype=np.uint8
+                    ),
+                    "image|features_cbcr": rng.integers(
+                        0, 255, size=(length, 2, 2, 2), dtype=np.uint8
+                    ),
                 },
                 "actions": {"action": rng.integers(0, 4, size=(length,)).astype(np.int64)},
                 "rewards": rng.standard_normal(length).astype(np.float32),
@@ -68,8 +77,9 @@ def test_epoch_data_iterator_yields_expected_batches(tmp_path):
 
     tok_batches = [batch for batch, phase in items if phase == 0]
     for batch in tok_batches:
-        # prefetch_tok extracts observation['image|features'][:, 0] directly
-        assert batch.shape == (4, 4, 4, 3)
+        # prefetch_tok extracts get_rgb_tensor(observation)[:, 0] -- YCbCr
+        # reconstructed back to RGB, CHW layout: (B, C, H, W).
+        assert batch.shape == (4, 3, 4, 4)
         assert batch.device.type == "cuda"
 
     # alignment="action_out" replaces observation/next_observation with the
@@ -77,12 +87,12 @@ def test_epoch_data_iterator_yields_expected_batches(tmp_path):
     # The container's own .device is None (entries carry their own).
     wm_batches = [batch for batch, phase in items if phase == 1]
     for batch in wm_batches:
-        assert batch["all_observations"]["image|features"].shape[0] == 2
+        assert batch["all_observations"]["image|features_y"].shape[0] == 2
         assert batch["reward"].device.type == "cuda"
 
     c_batches = [batch for batch, phase in items if phase == 2]
     for batch in c_batches:
-        assert batch["all_observations"]["image|features"].shape[0] == 2
+        assert batch["all_observations"]["image|features_y"].shape[0] == 2
         assert batch["reward"].device.type == "cuda"
 
 
@@ -110,7 +120,8 @@ def test_epoch_data_iterator_zero_steps_yields_nothing(tmp_path):
 def test_epoch_data_iterator_empty_dataset_returns_early(tmp_path):
     schema = DatasetSchema(
         fields=[
-            FieldSpec("image|features", (4, 4, 3), "uint8", role="observation"),
+            FieldSpec("image|features_y", (1, 4, 4), "uint8", role="observation"),
+            FieldSpec("image|features_cbcr", (2, 2, 2), "uint8", role="observation"),
             FieldSpec("action", (), "int64", role="action"),
             FieldSpec("reward", (), "float32", role="reward"),
         ]

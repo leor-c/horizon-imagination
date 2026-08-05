@@ -11,6 +11,7 @@ import click
 from datetime import datetime
 
 from config.agent import get_agent_online_config, Agent
+from config.env.default import get_default_env_config
 from horizon_imagination.envs import make_env
 
 
@@ -57,7 +58,10 @@ def train_agent(
     )
     # wandb_logger.watch(agent)
 
-    env, env_name = make_env(benchmark, portal_env_backend=portal_env_backend, env_name=game)
+    env_cfg = get_default_env_config(benchmark=benchmark, game=game)
+    env, env_name = make_env(
+        benchmark, portal_env_backend=portal_env_backend, env_name=game, resolution=env_cfg.resolution
+    )
     seed_str = f'_{seed}' if seed is not None else ''
     
     if discard_data:
@@ -67,12 +71,13 @@ def train_agent(
         data_path.mkdir(exist_ok=True, parents=True)
         
     agent_cfg = get_agent_online_config(
-        env=env, 
+        env=env,
         env_name=env_name,
-        replay_buf_data_path=data_path, 
+        replay_buf_data_path=data_path,
         baseline=baseline,
         # test_env=make_env(benchmark, env_name=env_name, portal_env_backend='mm')[0],
         decay_horizon=decay_horizon,
+        resolution=env_cfg.resolution,
         budget=budget,
     )
 

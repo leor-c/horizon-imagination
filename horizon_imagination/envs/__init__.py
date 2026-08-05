@@ -7,14 +7,17 @@ def make_craftium_env(
         env_name: str = "Craftium/ChopTree-v0",
         agent_in_docker: bool = True,
         frameskip: int = 4,
+        resolution: int = 64,
     ):
     import portal_env
 
     craftium_kwargs = {
-        'frameskip': frameskip, 
+        'frameskip': frameskip,
         'minetest_conf': {'time_speed': 0},  # No night, same time of day.
         'sync_mode': True,
         'fps_max': 200,
+        'obs_width': resolution,
+        'obs_height': resolution,
     }
     if env_name == 'Craftium/ChopTree-v0':
         craftium_kwargs['fps_max'] = 10
@@ -34,17 +37,18 @@ def make_craftium_env(
 
 
 def make_ale_env(
-        env_name: str = "ALE/Boxing-v5", 
-        terminate_on_life_loss: bool = False, 
+        env_name: str = "ALE/Boxing-v5",
+        terminate_on_life_loss: bool = False,
         sign_rewards: bool = False,
         repeat_action_probability: float = 0.0,
         agent_in_docker: bool = True,
+        resolution: int = 64,
     ):
     import portal_env
     from horizon_imagination.envs.wrappers import EpisodicLifeEnv, ResizeObsWrapper, NoopResetEnv, SignRewardWrapper
     env = portal_env.AgentSidePortal(
-        "ale", 
-        env_args=[env_name], 
+        "ale",
+        env_args=[env_name],
         env_kwargs={"repeat_action_probability": repeat_action_probability},
         agent_in_docker=agent_in_docker
     )
@@ -52,7 +56,7 @@ def make_ale_env(
         env = NoopResetEnv(env)
     if terminate_on_life_loss:
         env = EpisodicLifeEnv(env)
-    env = ResizeObsWrapper(env, size=(64, 64))
+    env = ResizeObsWrapper(env, size=(resolution, resolution))
     env = ImageChannelsFirst(env)
     if sign_rewards:
         env = SignRewardWrapper(env)
@@ -61,9 +65,10 @@ def make_ale_env(
     return env
 
 def make_env(
-        benchmark: Literal['craftium', 'ale'], 
+        benchmark: Literal['craftium', 'ale'],
         portal_env_backend: Literal['docker', 'micromamba', 'mm'],
         env_name: str = None,
+        resolution: int = 64,
     ) -> tuple[gym.Env, str]:
     if portal_env_backend == 'docker':
         agent_in_docker = True
@@ -71,9 +76,10 @@ def make_env(
         agent_in_docker = False
     else:
         raise NotImplementedError()
-    
+
     env_kwargs = {
-        'agent_in_docker': agent_in_docker, 
+        'agent_in_docker': agent_in_docker,
+        'resolution': resolution,
     }
     
     if benchmark == 'craftium':

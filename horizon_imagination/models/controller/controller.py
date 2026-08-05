@@ -15,6 +15,7 @@ from horizon_imagination.models.controller.actor_critic import ActorCritic, Outp
 from horizon_imagination.models.controller.return_scaler import EMAScaler
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.utilities import AdamWConfig, shift_fwd, RawMultiModalObs, TensorDictRollingContextBuffer
+from horizon_imagination.utilities.obs_codec import rgb_to_ycbcr_obs_np
 from horizon_imagination.models.world_model import RectifiedFlowWorldModel
 from horizon_imagination.models.world_model.action_producer import (
     StablePolicyActionProducer, NaivePolicyActionProducer
@@ -285,8 +286,8 @@ class Controller(L.LightningModule, Configurable):
                 rolling_context_buffer.reset(td_obs_latent)
                 context_actions, context_obs = rolling_context_buffer.get_context()
 
-            # add experience to the replay buffer:
-            writer = replay_buffer.new_episode(obs, None)
+            # add experience to the replay buffer (stored as YCbCr, not RGB):
+            writer = replay_buffer.new_episode(rgb_to_ycbcr_obs_np(obs), None)
             self._episode_id = writer.episode_id
 
             return context_actions, context_obs, writer
@@ -322,9 +323,10 @@ class Controller(L.LightningModule, Configurable):
             action_raw = action.item() if action.numel() == 1 else action.cpu().numpy()
             obs, reward, terminated, truncated, info = env.step(action_raw)
 
-            # Update the replay buffer:
+            # Update the replay buffer (stored as YCbCr, not RGB):
+            obs_stored = rgb_to_ycbcr_obs_np(obs)
             step = {
-                'observation': {str(k): v for k, v in obs.items()},
+                'observation': {str(k): v for k, v in obs_stored.items()},
                 'action': action[0, 0].cpu().numpy(),
                 'reward': reward,
                 'terminated': terminated,

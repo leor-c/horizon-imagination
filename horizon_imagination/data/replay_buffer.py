@@ -4,6 +4,7 @@ import episodata as ed
 from episodata.utils import batch_to_tensordict
 from collections import deque
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
+from horizon_imagination.utilities.obs_codec import get_rgb_tensor
 
 
 def infinite_loader(loader):
@@ -42,7 +43,7 @@ class EpochDataIterator(Configurable):
         # this fast on a zarr-backed replay buffer.
         tok_stream = self.config.replay_buffer.segment_stream(
             sequence_length=1,
-            fields=['image|features'],
+            fields=['image|features_y', 'image|features_cbcr'],
             batch_size=self.config.tokenizer_batch_size,
             read_chunk_size=self.config.read_chunk_size,
             # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
@@ -69,7 +70,7 @@ class EpochDataIterator(Configurable):
         def prefetch_tok():
             batch = batch_to_tensordict(next(tok_iter), device='cuda', include_all_observations=True)
             batch = batch['observation']
-            batch = batch['image|features'][:, 0]
+            batch = get_rgb_tensor(batch)[:, 0]
             buffer.append(batch)
 
         def prefetch_wm():
