@@ -62,5 +62,11 @@ class PerModalityTransform(BaseTransform, nn.Module):
         }, device=z.device, batch_size=z.batch_size)
         return x
 
+    def roundtrip(self, z: TensorDict, truncated: bool = False, *args, **kwargs) -> TensorDict:
+        return TensorDict({
+            k: self.get_transform(k).roundtrip(z_k, truncated=truncated, *args, **kwargs)
+            for k, z_k in z.items()
+        }, device=z.device, batch_size=z.batch_size)
+
 
 

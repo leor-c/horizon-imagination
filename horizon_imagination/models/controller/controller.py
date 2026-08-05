@@ -12,7 +12,8 @@ from tqdm import tqdm
 import episodata as ed
 
 from horizon_imagination.models.controller.actor_critic import ActorCritic, OutputsBuffer
-from horizon_imagination.models.controller.return_scaler import EMAScaler
+from horizon_imagination.models.controller.return_scaler import EMAScaler, RunningReturnStdScaler
+from horizon_imagination.models.controller.intrinsic_reward import LatentReconstructionResidual
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.utilities import AdamWConfig, shift_fwd, RawMultiModalObs, TensorDictRollingContextBuffer
 from horizon_imagination.utilities.obs_codec import rgb_to_ycbcr_obs_np
@@ -48,7 +49,14 @@ def _to_tensor_dict_obs(obs: RawMultiModalObs):
     return obs
 
 
-def make_valid_mask(ends, t):
+def make_trajectory_mask(ends):
+    """
+    (B, T) bool mask that is True up to and including each row's first termination.
+
+    Split out of ``make_valid_mask`` so the intrinsic reward can exclude post-terminal steps
+    from its running statistics without also pulling in the denoising-time masking (which
+    mutates its ``t`` argument and so cannot be called twice).
+    """
     B, T = ends.shape
 
     # Step 1: For each row, find the first index where A is True
@@ -64,7 +72,11 @@ def make_valid_mask(ends, t):
     range_matrix = torch.arange(T, device=ends.device).expand(B, T)
 
     # Step 3: Create mask
-    mask = range_matrix <= first_end_indices.unsqueeze(1)
+    return range_matrix <= first_end_indices.unsqueeze(1)
+
+
+def make_valid_mask(ends, t):
+    mask = make_trajectory_mask(ends)
 
     # Step 4: Compute the denoising time valid mask:
     valid_denoising_masks = []
@@ -216,6 +228,34 @@ class Controller(L.LightningModule, Configurable):
         entropy_weight: float = 0.001
         return_scaler_decay: float = 0.005
         baseline: Literal['hi', 'ar', 'naive'] = 'hi'
+        # How the latent reconstruction residual (see
+        # horizon_imagination.models.controller.intrinsic_reward) is auto-scaled before being
+        # added to the reward:
+        # - 'quantile_ema': the residual's scale (an EMA of a symmetric quantile band, same
+        #   mechanism as return_scaler) is matched to intrinsic_reward_target_ratio times the
+        #   extrinsic reward's own quantile-band scale -- i.e. relative to extrinsic reward.
+        # - 'rnd_return_std': RND-style (Burda et al., 2018) -- the residual is divided by a
+        #   running std of its own discounted *return* (less sensitive to heavy-tailed
+        #   per-step outliers), then multiplied by the fixed intrinsic_reward_coeff. This is
+        #   independent of the extrinsic reward's scale, per the original RND design, and is
+        #   the mode to use in sparse-reward environments.
+        intrinsic_reward_normalization: Literal['quantile_ema', 'rnd_return_std'] = 'quantile_ema'
+        # 'quantile_ema' mode: target scale of the intrinsic reward's contribution to the
+        # total reward, relative to extrinsic reward's own scale -- e.g. 0.5 means the
+        # residual is auto-scaled to roughly half the scale of the extrinsic reward,
+        # regardless of the residual's raw (tokenizer-dependent) magnitude. 0.0 = disabled.
+        intrinsic_reward_target_ratio: float = 0.0
+        # 'rnd_return_std' mode: fixed coefficient applied to the std-normalized intrinsic
+        # reward (RND's int_coeff). Unlike intrinsic_reward_target_ratio, this does NOT scale
+        # with the extrinsic reward.
+        intrinsic_reward_coeff: float = 1.0
+        # When True, imagination training optimizes only the scaled intrinsic reward --
+        # extrinsic reward is excluded from the total reward entirely (pure exploration).
+        pure_exploration: bool = False
+        # Use the truncated latent round-trip (see ImageToLatentTransform.roundtrip): stops
+        # short of pixel space, cutting the bonus's cost roughly in half and dropping the
+        # uint8/chroma noise floor, at the price of measuring a weaker property.
+        intrinsic_reward_truncated_roundtrip: bool = False
 
     def __init__(self, config: Config, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -225,6 +265,25 @@ class Controller(L.LightningModule, Configurable):
 
         self.actor_critic: ActorCritic = config.actor_critic.make_instance()
         self.return_scaler = EMAScaler(decay=config.return_scaler_decay)
+
+        self.use_intrinsic_reward = (config.intrinsic_reward_target_ratio != 0.0) or config.pure_exploration
+        self.intrinsic_residual = None
+        if self.use_intrinsic_reward:
+            assert config.world_model.obs_transform is not None, \
+                "The intrinsic reward needs the world model's obs_transform to run the " \
+                "encode(decode(z)) round-trip."
+            self.intrinsic_residual = LatentReconstructionResidual(
+                config.world_model.obs_transform,
+                ema_decay=config.return_scaler_decay,
+                truncated=config.intrinsic_reward_truncated_roundtrip,
+            )
+            self.extrinsic_reward_scaler = EMAScaler(decay=config.return_scaler_decay)
+            if config.intrinsic_reward_normalization == 'rnd_return_std':
+                self.intrinsic_reward_scaler = RunningReturnStdScaler(gamma=config.gae_gamma)
+            else:
+                assert config.intrinsic_reward_normalization == 'quantile_ema', \
+                    f"Got {config.intrinsic_reward_normalization}"
+                self.intrinsic_reward_scaler = EMAScaler(decay=config.return_scaler_decay)
 
         self.stats_collector = ExperienceStatisticsCollector()
 
@@ -485,19 +544,64 @@ class Controller(L.LightningModule, Configurable):
             f"{name}/normalized_advantage_avg": advantage.detach().mean(),
             f"{name}/normalized_advantage_max": advantage.detach().max(),
             f"{name}/normalized_advantage_min": advantage.detach().min(),
-            f"{name}/imagined_rewards_avg": traj_segment['reward'].detach().mean(),
-            f"{name}/imagined_rewards_max": traj_segment['reward'].detach().max(),
-            f"{name}/imagined_rewards_min": traj_segment['reward'].detach().min(),
+            # Deliberately the extrinsic reward, so these keys keep the meaning they had
+            # before the intrinsic bonus existed and stay comparable across runs.
+            f"{name}/imagined_rewards_avg": traj_segment['extrinsic_reward'].detach().mean(),
+            f"{name}/imagined_rewards_max": traj_segment['extrinsic_reward'].detach().max(),
+            f"{name}/imagined_rewards_min": traj_segment['extrinsic_reward'].detach().min(),
+            f"{name}/total_rewards_avg": traj_segment['reward'].detach().mean(),
             f"{name}/num_ends": traj_segment['terminated'].detach().float().sum(dim=1).mean(),
             f"{name}/avg_num_action_changes": avg_num_action_changes,
             f"{name}/avg_action_change_time": avg_action_change_time,
         }
+        if self.use_intrinsic_reward:
+            info.update({
+                f"{name}/intrinsic_reward_avg": traj_segment['intrinsic_reward'].detach().mean(),
+                f"{name}/intrinsic_reward_max": traj_segment['intrinsic_reward'].detach().max(),
+                f"{name}/intrinsic_reward_min": traj_segment['intrinsic_reward'].detach().min(),
+                f"{name}/intrinsic_reward_scaled_avg": traj_segment['intrinsic_reward_scaled'].detach().mean(),
+                f"{name}/intrinsic_reward_scaled_max": traj_segment['intrinsic_reward_scaled'].detach().max(),
+                f"{name}/intrinsic_reward_scaled_min": traj_segment['intrinsic_reward_scaled'].detach().min(),
+                f"{name}/intrinsic_reward_scale_factor": traj_segment['intrinsic_reward_scale_factor'].detach(),
+                f"{name}/intrinsic_reward_target_ratio": self.config.intrinsic_reward_target_ratio,
+                f"{name}/intrinsic_reward_coeff": self.config.intrinsic_reward_coeff,
+            })
+            # Per-key raw MSE / normalized means -- watch recon_mse's spread to confirm the
+            # residual carries signal above the uint8+chroma round-trip noise floor.
+            info.update({f"{name}/{k}": v for k, v in traj_segment['intrinsic_reward_info'].items()})
         if log_dict_fn is None:
             log_dict_fn = self.log_dict
         log_dict_fn(info, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
     
+    def _intrinsic_scale_factor(self):
+        """Maps the raw residual onto the reward's scale -- see intrinsic_reward_normalization.
+
+        Assumes both scalers have already been updated for this rollout.
+        """
+        if self.config.intrinsic_reward_normalization == 'rnd_return_std':
+            # RND (Burda et al., 2018): normalize by the running std of the discounted
+            # intrinsic return, then apply a fixed coefficient -- independent of the
+            # extrinsic reward's scale.
+            return (
+                self.config.intrinsic_reward_coeff
+                / torch.clamp_min(self.intrinsic_reward_scaler.scale, 1e-8)
+            ).detach()
+
+        if self.extrinsic_reward_scaler.scale < 1e-5:
+            # The extrinsic band is degenerate, so there is nothing to size the bonus
+            # against. Emitting the raw, unnormalized residual here would inject an arbitrary
+            # magnitude precisely in the sparse-reward case; disable the bonus instead and let
+            # the logged scale factor of 0 make that visible. 'rnd_return_std' is the mode
+            # intended for sparse-reward environments.
+            return torch.zeros_like(self.extrinsic_reward_scaler.scale)
+
+        return (
+            self.config.intrinsic_reward_target_ratio * self.extrinsic_reward_scaler.scale
+            / torch.clamp_min(self.intrinsic_reward_scaler.scale, 1e-8)
+        ).detach()
+
     def _process_imagined_data(self, traj_segment, actor_outs: OutputsBuffer, first_step_outs):
         first_action_dist, first_action_log_p, first_value, first_v_logits = first_step_outs
 
@@ -514,11 +618,42 @@ class Controller(L.LightningModule, Configurable):
             traj_segment['log_pi'] = torch.cat(traj_segment['log_pi'], dim=0)
 
         # Optimize only for the final rewards & terminations:
-        traj_segment['reward'] = traj_segment['reward']
-
         done_probs = traj_segment['terminated']
         dones = torch.distributions.Categorical(probs=done_probs).sample()
         traj_segment['terminated'] = dones
+
+        extrinsic_reward = traj_segment['reward']
+        traj_segment['extrinsic_reward'] = extrinsic_reward
+        if not self.use_intrinsic_reward:
+            return
+
+        # Post-termination the world model emits off-distribution frames, which is exactly
+        # where the reconstruction residual spikes. Those steps are already dropped from the
+        # losses, but letting them into the running statistics would inflate the scale and
+        # shrink every advantage -- so mask them out of the estimators.
+        on_trajectory = make_trajectory_mask(dones)
+        intrinsic_reward, residual_info = self.intrinsic_residual(
+            traj_segment['observation'], mask=on_trajectory
+        )
+
+        self.extrinsic_reward_scaler.update(extrinsic_reward.detach().float()[on_trajectory])
+        if self.config.intrinsic_reward_normalization == 'rnd_return_std':
+            # The return is a temporal accumulation, so it is fed the full (B, T) rollout
+            # rather than a masked selection.
+            self.intrinsic_reward_scaler.update(intrinsic_reward.detach().float())
+        else:
+            self.intrinsic_reward_scaler.update(intrinsic_reward.detach().float()[on_trajectory])
+        scale_factor = self._intrinsic_scale_factor()
+        scaled_intrinsic_reward = intrinsic_reward * scale_factor
+
+        traj_segment['intrinsic_reward'] = intrinsic_reward
+        traj_segment['intrinsic_reward_scaled'] = scaled_intrinsic_reward
+        traj_segment['intrinsic_reward_scale_factor'] = scale_factor
+        traj_segment['intrinsic_reward_info'] = residual_info
+        if self.config.pure_exploration:
+            traj_segment['reward'] = scaled_intrinsic_reward
+        else:
+            traj_segment['reward'] = extrinsic_reward + scaled_intrinsic_reward
 
     def _collect_action_changes_stats(self, actions, denoising_times):
         actions = torch.stack(actions, dim=0)
