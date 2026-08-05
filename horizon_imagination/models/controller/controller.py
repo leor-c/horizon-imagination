@@ -12,7 +12,7 @@ from tqdm import tqdm
 import episodata as ed
 
 from horizon_imagination.models.controller.actor_critic import ActorCritic, OutputsBuffer
-from horizon_imagination.models.controller.return_scaler import EMAScaler, RunningReturnStdScaler
+from horizon_imagination.models.controller.return_scaler import EMAScaler
 from horizon_imagination.models.controller.intrinsic_reward import LatentReconstructionResidual
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.utilities import AdamWConfig, shift_fwd, RawMultiModalObs, TensorDictRollingContextBuffer
@@ -228,29 +228,17 @@ class Controller(L.LightningModule, Configurable):
         entropy_weight: float = 0.001
         return_scaler_decay: float = 0.005
         baseline: Literal['hi', 'ar', 'naive'] = 'hi'
-        # How the latent reconstruction residual (see
-        # horizon_imagination.models.controller.intrinsic_reward) is auto-scaled before being
-        # added to the reward:
-        # - 'quantile_ema': the residual's scale (an EMA of a symmetric quantile band, same
-        #   mechanism as return_scaler) is matched to intrinsic_reward_target_ratio times the
-        #   extrinsic reward's own quantile-band scale -- i.e. relative to extrinsic reward.
-        # - 'rnd_return_std': RND-style (Burda et al., 2018) -- the residual is divided by a
-        #   running std of its own discounted *return* (less sensitive to heavy-tailed
-        #   per-step outliers), then multiplied by the fixed intrinsic_reward_coeff. This is
-        #   independent of the extrinsic reward's scale, per the original RND design, and is
-        #   the mode to use in sparse-reward environments.
-        intrinsic_reward_normalization: Literal['quantile_ema', 'rnd_return_std'] = 'quantile_ema'
-        # 'quantile_ema' mode: target scale of the intrinsic reward's contribution to the
-        # total reward, relative to extrinsic reward's own scale -- e.g. 0.5 means the
-        # residual is auto-scaled to roughly half the scale of the extrinsic reward,
-        # regardless of the residual's raw (tokenizer-dependent) magnitude. 0.0 = disabled.
-        intrinsic_reward_target_ratio: float = 0.0
-        # 'rnd_return_std' mode: fixed coefficient applied to the std-normalized intrinsic
-        # reward (RND's int_coeff). Unlike intrinsic_reward_target_ratio, this does NOT scale
-        # with the extrinsic reward.
-        intrinsic_reward_coeff: float = 1.0
+        # Weight on the latent reconstruction bonus (see
+        # horizon_imagination.models.controller.intrinsic_reward), which arrives already
+        # normalized per observation key. This is RND's fixed intrinsic coefficient
+        # (Burda et al., 2018) applied to an already-normalized signal -- the per-key
+        # normalizer plays the role RND's running return std plays there. Because the bonus
+        # has a band of roughly 1, a weight of w produces a contribution comparable to an
+        # extrinsic reward of magnitude w. 0.0 = disabled.
+        intrinsic_reward_weight: float = 0.0
         # When True, imagination training optimizes only the scaled intrinsic reward --
-        # extrinsic reward is excluded from the total reward entirely (pure exploration).
+        # extrinsic reward is excluded from the total reward entirely (pure exploration),
+        # as in Burda et al., 2018, "Large-Scale Study of Curiosity-Driven Learning".
         pure_exploration: bool = False
         # Use the truncated latent round-trip (see ImageToLatentTransform.roundtrip): stops
         # short of pixel space, cutting the bonus's cost roughly in half and dropping the
@@ -266,7 +254,10 @@ class Controller(L.LightningModule, Configurable):
         self.actor_critic: ActorCritic = config.actor_critic.make_instance()
         self.return_scaler = EMAScaler(decay=config.return_scaler_decay)
 
-        self.use_intrinsic_reward = (config.intrinsic_reward_target_ratio != 0.0) or config.pure_exploration
+        assert not (config.pure_exploration and config.intrinsic_reward_weight == 0.0), \
+            "pure_exploration excludes the extrinsic reward, so a zero " \
+            "intrinsic_reward_weight would train the actor on an all-zero reward."
+        self.use_intrinsic_reward = config.intrinsic_reward_weight != 0.0
         self.intrinsic_residual = None
         if self.use_intrinsic_reward:
             assert config.world_model.obs_transform is not None, \
@@ -277,13 +268,6 @@ class Controller(L.LightningModule, Configurable):
                 ema_decay=config.return_scaler_decay,
                 truncated=config.intrinsic_reward_truncated_roundtrip,
             )
-            self.extrinsic_reward_scaler = EMAScaler(decay=config.return_scaler_decay)
-            if config.intrinsic_reward_normalization == 'rnd_return_std':
-                self.intrinsic_reward_scaler = RunningReturnStdScaler(gamma=config.gae_gamma)
-            else:
-                assert config.intrinsic_reward_normalization == 'quantile_ema', \
-                    f"Got {config.intrinsic_reward_normalization}"
-                self.intrinsic_reward_scaler = EMAScaler(decay=config.return_scaler_decay)
 
         self.stats_collector = ExperienceStatisticsCollector()
 
@@ -562,9 +546,6 @@ class Controller(L.LightningModule, Configurable):
                 f"{name}/intrinsic_reward_scaled_avg": traj_segment['intrinsic_reward_scaled'].detach().mean(),
                 f"{name}/intrinsic_reward_scaled_max": traj_segment['intrinsic_reward_scaled'].detach().max(),
                 f"{name}/intrinsic_reward_scaled_min": traj_segment['intrinsic_reward_scaled'].detach().min(),
-                f"{name}/intrinsic_reward_scale_factor": traj_segment['intrinsic_reward_scale_factor'].detach(),
-                f"{name}/intrinsic_reward_target_ratio": self.config.intrinsic_reward_target_ratio,
-                f"{name}/intrinsic_reward_coeff": self.config.intrinsic_reward_coeff,
             })
             # Per-key raw MSE / normalized means -- watch recon_mse's spread to confirm the
             # residual carries signal above the uint8+chroma round-trip noise floor.
@@ -575,33 +556,6 @@ class Controller(L.LightningModule, Configurable):
 
         return loss
     
-    def _intrinsic_scale_factor(self):
-        """Maps the raw residual onto the reward's scale -- see intrinsic_reward_normalization.
-
-        Assumes both scalers have already been updated for this rollout.
-        """
-        if self.config.intrinsic_reward_normalization == 'rnd_return_std':
-            # RND (Burda et al., 2018): normalize by the running std of the discounted
-            # intrinsic return, then apply a fixed coefficient -- independent of the
-            # extrinsic reward's scale.
-            return (
-                self.config.intrinsic_reward_coeff
-                / torch.clamp_min(self.intrinsic_reward_scaler.scale, 1e-8)
-            ).detach()
-
-        if self.extrinsic_reward_scaler.scale < 1e-5:
-            # The extrinsic band is degenerate, so there is nothing to size the bonus
-            # against. Emitting the raw, unnormalized residual here would inject an arbitrary
-            # magnitude precisely in the sparse-reward case; disable the bonus instead and let
-            # the logged scale factor of 0 make that visible. 'rnd_return_std' is the mode
-            # intended for sparse-reward environments.
-            return torch.zeros_like(self.extrinsic_reward_scaler.scale)
-
-        return (
-            self.config.intrinsic_reward_target_ratio * self.extrinsic_reward_scaler.scale
-            / torch.clamp_min(self.intrinsic_reward_scaler.scale, 1e-8)
-        ).detach()
-
     def _process_imagined_data(self, traj_segment, actor_outs: OutputsBuffer, first_step_outs):
         first_action_dist, first_action_log_p, first_value, first_v_logits = first_step_outs
 
@@ -636,19 +590,16 @@ class Controller(L.LightningModule, Configurable):
             traj_segment['observation'], mask=on_trajectory
         )
 
-        self.extrinsic_reward_scaler.update(extrinsic_reward.detach().float()[on_trajectory])
-        if self.config.intrinsic_reward_normalization == 'rnd_return_std':
-            # The return is a temporal accumulation, so it is fed the full (B, T) rollout
-            # rather than a masked selection.
-            self.intrinsic_reward_scaler.update(intrinsic_reward.detach().float())
-        else:
-            self.intrinsic_reward_scaler.update(intrinsic_reward.detach().float()[on_trajectory])
-        scale_factor = self._intrinsic_scale_factor()
-        scaled_intrinsic_reward = intrinsic_reward * scale_factor
+        # The residual arrives normalized per key (band ~1), so all that is left is a fixed
+        # coefficient -- RND's structure, with the per-key normalizer standing in for RND's
+        # running return std. No second normalization stage: it would rescale an already
+        # scale-stationary signal, and crucially it could not remove the residual's large
+        # constant floor (measured at ~12x its own std on a trained tokenizer) -- only the
+        # centering inside the per-key normalizer does that.
+        scaled_intrinsic_reward = self.config.intrinsic_reward_weight * intrinsic_reward
 
         traj_segment['intrinsic_reward'] = intrinsic_reward
         traj_segment['intrinsic_reward_scaled'] = scaled_intrinsic_reward
-        traj_segment['intrinsic_reward_scale_factor'] = scale_factor
         traj_segment['intrinsic_reward_info'] = residual_info
         if self.config.pure_exploration:
             traj_segment['reward'] = scaled_intrinsic_reward

@@ -133,63 +133,6 @@ def test_all_off_trajectory_batch_yields_zero_without_crashing():
 
 
 # --------------------------------------------------------------------------------------
-# Scale-factor selection.
-# --------------------------------------------------------------------------------------
-
-class _ScalerStub:
-    def __init__(self, scale):
-        self.scale = torch.tensor(float(scale))
-
-
-class _ConfigStub:
-    def __init__(self, normalization, target_ratio=0.5, coeff=2.0):
-        self.intrinsic_reward_normalization = normalization
-        self.intrinsic_reward_target_ratio = target_ratio
-        self.intrinsic_reward_coeff = coeff
-
-
-def _scale_factor(normalization, extrinsic_scale, intrinsic_scale, **kw):
-    from horizon_imagination.models.controller.controller import Controller
-
-    ctl = Controller.__new__(Controller)  # bypass __init__; only the scalers are needed
-    ctl.config = _ConfigStub(normalization, **kw)
-    ctl.extrinsic_reward_scaler = _ScalerStub(extrinsic_scale)
-    ctl.intrinsic_reward_scaler = _ScalerStub(intrinsic_scale)
-    return float(Controller._intrinsic_scale_factor(ctl))
-
-
-def test_quantile_ema_sizes_the_bonus_against_the_extrinsic_band():
-    assert _scale_factor('quantile_ema', extrinsic_scale=0.08, intrinsic_scale=0.8) == \
-        pytest.approx(0.5 * 0.08 / 0.8)
-
-
-def test_degenerate_extrinsic_band_disables_the_bonus():
-    """Rather than falling back to the raw, unnormalized residual -- which would inject an
-    arbitrary magnitude exactly in the sparse-reward case."""
-    assert _scale_factor('quantile_ema', extrinsic_scale=0.0, intrinsic_scale=0.8) == 0.0
-
-
-def test_rnd_mode_ignores_the_extrinsic_scale():
-    degenerate = _scale_factor('rnd_return_std', extrinsic_scale=0.0, intrinsic_scale=0.5)
-    healthy = _scale_factor('rnd_return_std', extrinsic_scale=10.0, intrinsic_scale=0.5)
-    assert degenerate == healthy == pytest.approx(2.0 / 0.5)
-
-
-def test_running_return_std_scaler_tracks_discounted_return_spread():
-    from horizon_imagination.models.controller.return_scaler import RunningReturnStdScaler
-
-    scaler = RunningReturnStdScaler(gamma=0.99)
-    scaler.update(torch.randn(16, 20) * 3.0)
-    big = float(scaler.scale)
-
-    scaler = RunningReturnStdScaler(gamma=0.99)
-    scaler.update(torch.randn(16, 20) * 0.01)
-    small = float(scaler.scale)
-
-    assert big > 10 * small
-
-
-# --------------------------------------------------------------------------------------
 # The real tokenizer round-trip.
 # --------------------------------------------------------------------------------------
 
@@ -305,8 +248,8 @@ def test_truncated_roundtrip_preserves_a_batch_dim_of_any_rank():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("normalization", ['quantile_ema', 'rnd_return_std'])
-def test_controller_step_adds_the_bonus_and_logs_it(normalization, tmp_path):
+@pytest.mark.parametrize("truncated", [False, True])
+def test_controller_step_adds_the_bonus_and_logs_it(truncated, tmp_path):
     from config.agent import get_agent_online_config
     from horizon_imagination.agent import Agent
     from horizon_imagination.data import EpochDataIterator
@@ -315,10 +258,8 @@ def test_controller_step_adds_the_bonus_and_logs_it(normalization, tmp_path):
     cfg = get_agent_online_config(
         env=env, env_name='Synthetic/Test-v0',
         replay_buf_data_path=tmp_path / 'rb', resolution=RESOLUTION,
-        intrinsic_reward_normalization=normalization,
-        intrinsic_reward_target_ratio=0.5,
-        # The truncated round-trip is the intended default cost profile; exercise it here.
-        intrinsic_reward_truncated_roundtrip=(normalization == 'quantile_ema'),
+        intrinsic_reward_weight=0.5,
+        intrinsic_reward_truncated_roundtrip=truncated,
     )
     cfg.controller.config.imagination_batch_size = 4
     cfg.controller.config.imagination_horizon = 4
@@ -351,17 +292,27 @@ def test_controller_step_adds_the_bonus_and_logs_it(normalization, tmp_path):
         )
         assert np.isfinite(float(loss.detach()))
 
-    assert 'actor_critic/intrinsic_reward_scale_factor' in logged
     assert 'actor_critic/recon_mse/image|rgb' in logged
     assert 'actor_critic/recon_mse/vector|proprio' in logged
     # imagined_rewards_* must keep meaning the extrinsic reward.
     assert 'actor_critic/imagined_rewards_avg' in logged
     assert 'actor_critic/total_rewards_avg' in logged
 
-    # The bonus must actually be live -- not silently zeroed by the degenerate-band branch.
-    scale_factor = float(logged['actor_critic/intrinsic_reward_scale_factor'])
-    assert scale_factor > 0, "intrinsic bonus was disabled; the assertions below would be vacuous"
-    assert float(logged['actor_critic/intrinsic_reward_avg']) > 0
+    # The bonus must actually move the reward, or the assertions above are vacuous.
+    assert float(logged['actor_critic/intrinsic_reward_scaled_avg']) != 0.0
     assert float(logged['actor_critic/total_rewards_avg']) != pytest.approx(
         float(logged['actor_critic/imagined_rewards_avg'])
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pure_exploration_without_a_weight_is_rejected(tmp_path):
+    """Otherwise the actor silently trains on an all-zero reward."""
+    from config.agent import get_agent_online_config
+
+    with pytest.raises(AssertionError, match="all-zero reward"):
+        get_agent_online_config(
+            env=_make_env(), env_name='Synthetic/Test-v0',
+            replay_buf_data_path=tmp_path / 'rb', resolution=RESOLUTION,
+            pure_exploration=True, intrinsic_reward_weight=0.0,
+        )

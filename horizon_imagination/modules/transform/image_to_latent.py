@@ -88,10 +88,17 @@ class ImageToLatentTransform(BaseTransform):
         equals the encoder's last downsample input. The asserts below re-check that, so a
         change to channels_mult fails loudly instead of silently comparing mismatched tensors.
 
-        Cheaper *and* cleaner than the full round-trip: it never reaches pixel space, so it
-        also avoids the uint8-quantization and 4:2:0 chroma noise floor that
-        _postprocess_images/_preprocess_images bake into the full cycle. It measures a weaker
-        property though -- self-consistency under a partial cycle, not manifold membership.
+        Worth it purely on cost, not on signal quality. Measured against a trained tokenizer
+        (256 latents, resolution 64): the residual on on-manifold latents -- the constant
+        "floor" that carries no novelty -- is 0.086 truncated vs 0.079 for the full cycle, and
+        the ratio of off-manifold to on-manifold residual is 4.4x vs 4.6x. So truncation is
+        marginally *worse* on both counts, for ~7x less compute.
+
+        It does skip the uint8/4:2:0-chroma floor of _postprocess_images/_preprocess_images,
+        but that is more than offset by a floor of its own: the full cycle inherits
+        enc(dec(z)) ~ z from AE training, whereas this partial composition was never trained
+        toward identity. It also measures a weaker property -- self-consistency under a
+        partial cycle, not manifold membership.
         """
         from horizon_imagination.models.tokenizer.cosmos.networks import ContinuousImageTokenizer
         from horizon_imagination.models.tokenizer.cosmos.modules.utils import nonlinearity

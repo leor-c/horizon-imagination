@@ -100,9 +100,7 @@ def get_controller_config(
         device,
         dtype,
         baseline: Literal['hi', 'ar', 'naive'] = 'hi',
-        intrinsic_reward_normalization: Literal['quantile_ema', 'rnd_return_std'] = 'quantile_ema',
-        intrinsic_reward_target_ratio: float = 0.0,
-        intrinsic_reward_coeff: float = 1.0,
+        intrinsic_reward_weight: float = 0.0,
         pure_exploration: bool = False,
         intrinsic_reward_truncated_roundtrip: bool = False,
     ):
@@ -145,9 +143,7 @@ def get_controller_config(
         entropy_weight=entropy_weight,
         return_scaler_decay=return_scaler_decay,
         baseline=baseline,
-        intrinsic_reward_normalization=intrinsic_reward_normalization,
-        intrinsic_reward_target_ratio=intrinsic_reward_target_ratio,
-        intrinsic_reward_coeff=intrinsic_reward_coeff,
+        intrinsic_reward_weight=intrinsic_reward_weight,
         pure_exploration=pure_exploration,
         intrinsic_reward_truncated_roundtrip=intrinsic_reward_truncated_roundtrip,
     )

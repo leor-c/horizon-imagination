@@ -37,9 +37,7 @@ def get_agent_online_config(
         decay_horizon: float = 4,
         budget: int = 32,
         resolution: int = 64,
-        intrinsic_reward_normalization: Literal['quantile_ema', 'rnd_return_std'] = 'quantile_ema',
-        intrinsic_reward_target_ratio: float = 0.0,
-        intrinsic_reward_coeff: float = 1.0,
+        intrinsic_reward_weight: float = 0.0,
         pure_exploration: bool = False,
         intrinsic_reward_truncated_roundtrip: bool = False,
     ):
@@ -155,9 +153,7 @@ def get_agent_online_config(
         device=device,
         dtype=dtype,
         baseline=baseline,
-        intrinsic_reward_normalization=intrinsic_reward_normalization,
-        intrinsic_reward_target_ratio=intrinsic_reward_target_ratio,
-        intrinsic_reward_coeff=intrinsic_reward_coeff,
+        intrinsic_reward_weight=intrinsic_reward_weight,
         pure_exploration=pure_exploration,
         intrinsic_reward_truncated_roundtrip=intrinsic_reward_truncated_roundtrip,
     )

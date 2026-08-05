@@ -33,9 +33,7 @@ def train_agent(
         discard_data: bool = False,
         decay_horizon: float = 4,
         budget: int = 16,
-        intrinsic_reward_normalization: str = 'quantile_ema',
-        intrinsic_reward_target_ratio: float = 0.0,
-        intrinsic_reward_coeff: float = 1.0,
+        intrinsic_reward_weight: float = 0.0,
         pure_exploration: bool = False,
         intrinsic_reward_truncated_roundtrip: bool = False,
     ):
@@ -59,9 +57,7 @@ def train_agent(
             'budget': budget,
             'discard_data': discard_data,
             'outputs_path': outputs_path,
-            'intrinsic_reward_normalization': intrinsic_reward_normalization,
-            'intrinsic_reward_target_ratio': intrinsic_reward_target_ratio,
-            'intrinsic_reward_coeff': intrinsic_reward_coeff,
+            'intrinsic_reward_weight': intrinsic_reward_weight,
             'pure_exploration': pure_exploration,
             'intrinsic_reward_truncated_roundtrip': intrinsic_reward_truncated_roundtrip,
         }
@@ -89,9 +85,7 @@ def train_agent(
         decay_horizon=decay_horizon,
         resolution=env_cfg.resolution,
         budget=budget,
-        intrinsic_reward_normalization=intrinsic_reward_normalization,
-        intrinsic_reward_target_ratio=intrinsic_reward_target_ratio,
-        intrinsic_reward_coeff=intrinsic_reward_coeff,
+        intrinsic_reward_weight=intrinsic_reward_weight,
         pure_exploration=pure_exploration,
         intrinsic_reward_truncated_roundtrip=intrinsic_reward_truncated_roundtrip,
     )
@@ -149,24 +143,12 @@ def train_agent(
 @click.option('--decay_horizon', type=float, default=4)
 @click.option('--budget', type=int, default=32)
 @click.option(
-    '--intrinsic-reward-normalization',
-    type=click.Choice(['quantile_ema', 'rnd_return_std']),
-    default='quantile_ema',
-    help="How the latent reconstruction bonus is auto-scaled. 'rnd_return_std' is the mode "
-         "for sparse-reward environments, where the extrinsic band is near-degenerate."
-)
-@click.option(
-    '--intrinsic-reward-target-ratio',
+    '--intrinsic-reward-weight',
     type=float,
     default=0.0,
-    help="'quantile_ema' mode: bonus scale as a fraction of the extrinsic reward's own "
-         "scale. 0 disables the intrinsic reward entirely."
-)
-@click.option(
-    '--intrinsic-reward-coeff',
-    type=float,
-    default=1.0,
-    help="'rnd_return_std' mode: fixed coefficient on the std-normalized bonus."
+    help="Weight on the latent reconstruction bonus. The bonus is normalized per observation "
+         "key to a band of ~1, so this is roughly the extrinsic-reward magnitude it is worth. "
+         "0 disables it."
 )
 @click.option(
     '--pure-exploration',
@@ -190,9 +172,7 @@ def main(
     discard_data: bool,
     decay_horizon: float,
     budget: int,
-    intrinsic_reward_normalization: str,
-    intrinsic_reward_target_ratio: float,
-    intrinsic_reward_coeff: float,
+    intrinsic_reward_weight: float,
     pure_exploration: bool,
     intrinsic_reward_truncated_roundtrip: bool,
 ):
@@ -216,9 +196,7 @@ def main(
         discard_data=discard_data,
         decay_horizon=decay_horizon,
         budget=budget,
-        intrinsic_reward_normalization=intrinsic_reward_normalization,
-        intrinsic_reward_target_ratio=intrinsic_reward_target_ratio,
-        intrinsic_reward_coeff=intrinsic_reward_coeff,
+        intrinsic_reward_weight=intrinsic_reward_weight,
         pure_exploration=pure_exploration,
         intrinsic_reward_truncated_roundtrip=intrinsic_reward_truncated_roundtrip,
     )
