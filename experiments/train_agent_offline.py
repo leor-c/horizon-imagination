@@ -21,8 +21,13 @@ def load_pretrained_agent(agent_cfg, weights_path, load_type):
 
     if load_type == 'all':
         agent = Agent.load_from_checkpoint(weights_path, config=agent_cfg)
-    else: 
-        agent.tokenizer.load_state_dict(tok_weights)
+    else:
+        # Checkpoints predating dict observations hold the image tokenizer directly
+        # under 'tokenizer.', which is now the image stage of the obs encoder stack.
+        if any(k.startswith('image.') for k in tok_weights):
+            agent.tokenizer.load_state_dict(tok_weights)
+        else:
+            agent.tokenizer.image.load_state_dict(tok_weights)
 
         if load_type == 'wm':
             agent.world_model.load_state_dict(wm_weights)

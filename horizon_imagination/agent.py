@@ -19,11 +19,11 @@ from horizon_imagination.data import (
     EpochDataIterator
 )
 from horizon_imagination.data.replay_buffer import infinite_loader
-from horizon_imagination.models.tokenizer import CosmosImageTokenizer
+from horizon_imagination.models.tokenizer import ObsEncoderStack
 from horizon_imagination.models.world_model import RectifiedFlowWorldModel
 from horizon_imagination.models.controller import Controller
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
-from horizon_imagination.utilities.types import ObsKey, Modality
+from horizon_imagination.utilities.types import ObsKey, Modality, image_keys
 from horizon_imagination.utilities.obs_codec import ycbcr_to_rgb_obs
 from horizon_imagination.utilities.visualization import make_border, generate_video, to_img
 from horizon_imagination.utilities import shift_fwd
@@ -31,6 +31,11 @@ from horizon_imagination.models.world_model.action_producer import (
     StablePolicyActionProducer, FixedActionProducer, NaivePolicyActionProducer,
     NaivePseudoPolicyActionProducer, StablePseudoPolicyActionProducer
 )
+
+
+def _stack_image_keys(frames: list[np.ndarray]) -> np.ndarray:
+    """Stack the per-image-key frames (b t h w c) vertically into one video frame."""
+    return frames[0] if len(frames) == 1 else np.concatenate(frames, axis=2)
 
 
 def _log_files_to_dir(src_dir: Path, dst_dir: Path):
@@ -96,7 +101,7 @@ class Agent(Configurable, L.LightningModule):
         action_space: Space
         env: Env
         replay_buffer: ed.Dataset
-        image_tokenizer: CosmosImageTokenizer
+        obs_encoder: ObsEncoderStack
         world_model: RectifiedFlowWorldModel
         controller: Controller
 
@@ -114,7 +119,7 @@ class Agent(Configurable, L.LightningModule):
 
         self.rb = config.replay_buffer
 
-        self.tokenizer: CosmosImageTokenizer = config.image_tokenizer
+        self.tokenizer: ObsEncoderStack = config.obs_encoder
 
         self.world_model: RectifiedFlowWorldModel = config.world_model
         self.controller: Controller = config.controller
@@ -291,7 +296,6 @@ class Agent(Configurable, L.LightningModule):
         horizon = segment_length - context_length
 
         num_iter = 1
-        img_key = ObsKey.from_parts(Modality.image, 'features')
         batch_size = batch.shape[0]
 
         context_actions = shift_fwd(batch['action'][:, :context_length])
@@ -300,7 +304,12 @@ class Agent(Configurable, L.LightningModule):
 
         obs = TensorDict(batch['observation'], batch_size=[batch_size, segment_length])
         obs = ycbcr_to_rgb_obs(obs, drop_ycbcr=True)
-        np_ctx = rearrange(obs[:, :context_length][img_key].clone(), 'b t c h w -> b t h w c').cpu().numpy()
+        # Every image key gets its own row of the video frame:
+        img_keys = image_keys(obs.keys())
+        np_ctx = _stack_image_keys([
+            rearrange(obs[:, :context_length][k].clone(), 'b t c h w -> b t h w c').cpu().numpy()
+            for k in img_keys
+        ])
         np_ctx = make_border(np_ctx, width=3, color=(100, 100, 250))
         predictions = []
         
@@ -362,14 +371,22 @@ class Agent(Configurable, L.LightningModule):
                 'observation': torch.cat([s['observation'] for s in segments], dim=1)
             }
             obs_hat = segment['observation']
-            obs_hat = to_img(self.tokenizer, obs_hat[img_key])
+            obs_hat = _stack_image_keys([to_img(self.tokenizer.image, obs_hat[k]) for k in img_keys])
             obs_hat = np.concatenate([np_ctx, obs_hat], axis=1)
             predictions.append(obs_hat)
 
-        ground_truth = rearrange(obs[:, context_length:][img_key], 'b t c h w -> b t h w c').cpu().numpy()
+        ground_truth = _stack_image_keys([
+            rearrange(obs[:, context_length:][k], 'b t c h w -> b t h w c').cpu().numpy()
+            for k in img_keys
+        ])
         ground_truth = np.concatenate([np_ctx, ground_truth], axis=1)
-        rec = self.tokenizer.forward(obs[:, context_length:][img_key].flatten(0, 1))
-        rec = rearrange(rec, '(b t) c h w -> b t h w c', b=batch_size).cpu().numpy()
+        rec = _stack_image_keys([
+            rearrange(
+                self.tokenizer.image.forward(obs[:, context_length:][k].flatten(0, 1)),
+                '(b t) c h w -> b t h w c', b=batch_size
+            ).cpu().numpy()
+            for k in img_keys
+        ])
         rec = np.concatenate([np_ctx, rec], axis=1)
 
         labels = ['Ground Truth', 'Reconstructions', 'Fixed', 'Naive', 'Ours']

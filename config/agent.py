@@ -7,7 +7,10 @@ import episodata as ed
 from episodata.utils import schema_from_gym_spaces
 
 from horizon_imagination.agent import Agent
+from horizon_imagination.models.tokenizer import ObsEncoderStack, VectorAutoencoder, VectorKeySpec
 from horizon_imagination.utilities.config import BaseConfig
+from horizon_imagination.utilities.types import image_keys, vector_keys
+from horizon_imagination.utilities.obs_codec import y_key, cbcr_key
 from config.tokenizer.image.cosmos import get_cosmos_tokenizer_online_config, CosmosImageTokenizer
 from config.world_model.flow_online import get_world_model_online_config, RectifiedFlowWorldModel
 from config.controller.default import get_controller_config
@@ -75,6 +78,11 @@ def get_agent_online_config(
     collection_steps_per_epoch = 200
     controller_test_frequency = 50
 
+    # Vector observations: latent width per token, and how many raw features each
+    # token covers (None -> the whole vector is a single token).
+    vector_latent_dim = 32
+    vector_chunk_size = None
+
     read_chunk_size = 4096
 
     # Init config instance:
@@ -83,17 +91,38 @@ def get_agent_online_config(
 
     tokenizer_cfg = get_cosmos_tokenizer_online_config(dtype=dtype, resolution=resolution)
     tokenizer_channels = tokenizer_cfg.latent_channels
-    
+    latent_size = resolution // tokenizer_cfg.network_cfg.spatial_compression
+    latent_spatial_shape = (latent_size, latent_size)
+
     tokenizer: CosmosImageTokenizer = init_component(
         tokenizer_cfg,
         load_pretrained_tokenizer,
         tokenizer_weights_path
     )
 
+    vec_keys = vector_keys(observation_space.spaces.keys())
+    vector_autoencoder: VectorAutoencoder = None
+    if vec_keys:
+        vector_autoencoder = VectorAutoencoder.Config(
+            obs_specs={k: VectorKeySpec.from_box(observation_space.spaces[k]) for k in vec_keys},
+            latent_dim=vector_latent_dim,
+            chunk_size=vector_chunk_size,
+            device=device,
+            dtype=dtype,
+        ).make_instance()
+
+    obs_encoder = ObsEncoderStack.Config(
+        image_tokenizer=tokenizer,
+        vector_autoencoder=vector_autoencoder,
+    ).make_instance()
+
     wm_cfg = get_world_model_online_config(
+        obs_space=observation_space,
         action_space=action_space,
         tokenizer_channels=tokenizer_channels,
+        latent_spatial_shape=latent_spatial_shape,
         image_tokenizer=tokenizer,
+        vector_autoencoder=vector_autoencoder,
         baseline=baseline,
         decay_horizon=decay_horizon,
         device=device,
@@ -110,9 +139,12 @@ def get_agent_online_config(
 
     controller_cfg = get_controller_config(
         env_name=env_name,
+        obs_space=observation_space,
         action_space=action_space,
         tokenizer_channels=tokenizer_channels,
+        latent_spatial_shape=latent_spatial_shape,
         world_model=world_model,
+        vector_autoencoder=vector_autoencoder,
         imagination_horizon=imagination_horizon,
         budget=budget,
         device=device,
@@ -125,17 +157,20 @@ def get_agent_online_config(
         controller_weights_path
     )
 
+    # Images are stored as YCbCr components (4:2:0), not RGB -- one pair of fields
+    # per image key:
     schema = schema_from_gym_spaces(env.observation_space, env.action_space)
-    img_field = schema.fields.pop('image|features')
-    h, w = img_field.shape[-2:]
-    schema.fields['image|features_y'] = ed.FieldSpec(
-        key='image|features_y', shape=(1, h, w), dtype='uint8',
-        role='observation', low=0, high=255, layout='CHW',
-    )
-    schema.fields['image|features_cbcr'] = ed.FieldSpec(
-        key='image|features_cbcr', shape=(2, h // 2, w // 2), dtype='uint8',
-        role='observation', low=0, high=255, layout='CHW',
-    )
+    for key in image_keys(observation_space.spaces.keys()):
+        img_field = schema.fields.pop(str(key))
+        h, w = img_field.shape[-2:]
+        for component_key, shape in [
+            (y_key(key), (1, h, w)),
+            (cbcr_key(key), (2, h // 2, w // 2)),
+        ]:
+            schema.fields[str(component_key)] = ed.FieldSpec(
+                key=str(component_key), shape=shape, dtype='uint8',
+                role='observation', low=0, high=255, layout='CHW',
+            )
     replay_buffer = ed.Dataset.create(schema=schema, path=replay_buf_data_path)
 
     agent_cfg = Agent.Config(
@@ -143,7 +178,7 @@ def get_agent_online_config(
         action_space=action_space,
         env=env,
         replay_buffer=replay_buffer,
-        image_tokenizer=tokenizer,
+        obs_encoder=obs_encoder,
         world_model=world_model,
         controller=controller,
         training=Agent.Config.OnlineTrainingConfig(

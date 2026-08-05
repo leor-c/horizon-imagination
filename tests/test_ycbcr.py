@@ -3,8 +3,14 @@ from tensordict.tensordict import TensorDict
 
 from horizon_imagination.utilities.ycbcr import YCbCrTensor
 from horizon_imagination.utilities.obs_codec import (
-    RGB_KEY, Y_KEY, CBCR_KEY, rgb_to_ycbcr_obs, ycbcr_to_rgb_obs, get_rgb_tensor,
+    rgb_to_ycbcr_obs, ycbcr_to_rgb_obs, get_rgb_tensors, y_key, cbcr_key,
 )
+from horizon_imagination.utilities.types import ObsKey, Modality
+
+
+RGB_KEY = ObsKey.from_parts(Modality.image, 'features')
+Y_KEY = y_key(RGB_KEY)
+CBCR_KEY = cbcr_key(RGB_KEY)
 
 
 def _make_rgb(*shape):
@@ -59,7 +65,7 @@ def test_obs_codec_round_trip_on_tensordict():
     assert diff.mean() < 5.0
 
 
-def test_get_rgb_tensor_is_noop_passthrough_when_already_rgb():
+def test_get_rgb_tensors_is_noop_passthrough_when_already_rgb():
     rgb = _make_rgb(2)
     obs = TensorDict({RGB_KEY: rgb}, batch_size=(2,))
-    assert torch.equal(get_rgb_tensor(obs), rgb)
+    assert torch.equal(get_rgb_tensors(obs)[RGB_KEY], rgb)

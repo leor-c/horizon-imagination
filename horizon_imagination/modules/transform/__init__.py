@@ -3,4 +3,6 @@ from horizon_imagination.modules.transform.chain import ChainTransform
 from horizon_imagination.modules.transform.image_latent_to_flat import ImageLatentToVecTransform, ImagePatcherTransform
 from horizon_imagination.modules.transform.image_to_latent import ImageToLatentTransform
 from horizon_imagination.modules.transform.image_latent_to_code import ImageLatentToCodeTransform
-from horizon_imagination.modules.transform.multi_modal import MultiModalCatAndFlatten, PerModalityTransform
+from horizon_imagination.modules.transform.vector_to_latent import VectorToLatentTransform
+from horizon_imagination.modules.transform.vector_latent import VectorTokenTransform, VectorLatentToVecTransform
+from horizon_imagination.modules.transform.multi_modal import PerModalityTransform

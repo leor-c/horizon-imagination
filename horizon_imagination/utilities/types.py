@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from enum import Enum
 import re
 
@@ -50,3 +51,37 @@ class ObsKey(str):
 
 MultiModalObs = dict[ObsKey, Tensor]
 RawMultiModalObs = dict[ObsKey, np.ndarray]
+
+
+def keys_of_modality(keys: Iterable[str], modality: Modality) -> list[ObsKey]:
+    """The keys of a single modality, sorted by name."""
+    return sorted(
+        (ObsKey(k) for k in keys if ObsKey(k).modality == modality),
+        key=lambda k: k.name
+    )
+
+
+def image_keys(keys: Iterable[str]) -> list[ObsKey]:
+    return keys_of_modality(keys, Modality.image)
+
+
+def vector_keys(keys: Iterable[str]) -> list[ObsKey]:
+    return keys_of_modality(keys, Modality.vector)
+
+
+def canonical_obs_keys(keys: Iterable[str]) -> list[ObsKey]:
+    """
+    A deterministic ordering of observation keys: images first (sorted by name),
+    then vectors (sorted by name).
+
+    Token order in the world model, channel order in the conv backbones and field
+    order in the replay buffer are all derived from this, so that they agree with
+    each other and stay stable across runs (dict iteration order depends on how the
+    obs space was built, which is not something we control).
+    """
+    keys = list(keys)
+    ordered = image_keys(keys) + vector_keys(keys)
+    unsupported = set(map(str, keys)) - set(map(str, ordered))
+    assert not unsupported, \
+        f"Unsupported observation modalities: {sorted(unsupported)}"
+    return ordered

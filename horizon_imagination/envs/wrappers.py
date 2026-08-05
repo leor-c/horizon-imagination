@@ -57,23 +57,64 @@ class ModalityDictObsWrapper(gym.ObservationWrapper):
         return {self.obs_keys[0]: observation}
 
 
-class ImageChannelsFirst(gym.ObservationWrapper):
+def _is_image_space(space: gym.Space) -> bool:
+    return isinstance(space, gym.spaces.Box) and np.issubdtype(space.dtype, np.uint8) \
+        and len(space.shape) == 3
+
+
+class _PerImageKeyObservationWrapper(gym.ObservationWrapper):
+    """
+    Base for the raw-image preprocessing wrappers, which run *before*
+    ``ModalityDictObsWrapper`` and therefore see either a single Box observation or a
+    Dict of them. Subclasses only implement the single-image transform; this class
+    applies it to every image entry of a Dict observation and leaves the rest alone.
+    """
 
     def __init__(self, env: Env[ObsType, ActType]):
         super().__init__(env)
 
-        assert isinstance(self.observation_space, gym.spaces.Box)
+        space = env.observation_space
+        self.is_dict_env = isinstance(space, gym.spaces.Dict)
+        if self.is_dict_env:
+            self.image_keys = [k for k, v in space.spaces.items() if _is_image_space(v)]
+            assert self.image_keys, f"No image entries in observation space {space}."
+            self.observation_space = gym.spaces.Dict({
+                k: self.transform_space(v) if k in self.image_keys else v
+                for k, v in space.spaces.items()
+            })
+        else:
+            assert _is_image_space(space), f"Expected an image observation space, got {space}."
+            self.image_keys = None
+            self.observation_space = self.transform_space(space)
 
-        self.observation_space = gym.spaces.Box(
-            low=np.transpose(self.observation_space.low, (2, 0, 1)),
-            high=np.transpose(self.observation_space.high, (2, 0, 1)),
-            dtype=self.observation_space.dtype,
-        )
+    def transform_space(self, space: gym.spaces.Box) -> gym.spaces.Box:
+        raise NotImplementedError
+
+    def transform_image(self, image: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
 
     def observation(self, observation):
-        assert isinstance(observation, np.ndarray)
-        assert observation.shape[-1] == 3, f"Got shape {observation.shape}"
-        return np.transpose(observation, (2, 0, 1))
+        if self.is_dict_env:
+            return {
+                k: self.transform_image(v) if k in self.image_keys else v
+                for k, v in observation.items()
+            }
+        return self.transform_image(observation)
+
+
+class ImageChannelsFirst(_PerImageKeyObservationWrapper):
+
+    def transform_space(self, space: gym.spaces.Box) -> gym.spaces.Box:
+        return gym.spaces.Box(
+            low=np.transpose(space.low, (2, 0, 1)),
+            high=np.transpose(space.high, (2, 0, 1)),
+            dtype=space.dtype,
+        )
+
+    def transform_image(self, image: np.ndarray) -> np.ndarray:
+        assert isinstance(image, np.ndarray)
+        assert image.shape[-1] == 3, f"Got shape {image.shape}"
+        return np.transpose(image, (2, 0, 1))
 
 
 class FrameSkip(gym.Wrapper):
@@ -95,21 +136,26 @@ class FrameSkip(gym.Wrapper):
         return obs, total_reward, terminated, truncated, info
     
 
-class ResizeObsWrapper(gym.ObservationWrapper):
+class ResizeObsWrapper(_PerImageKeyObservationWrapper):
     def __init__(self, env: gym.Env, size: Tuple[int, int]) -> None:
-        gym.ObservationWrapper.__init__(self, env)
         self.size = tuple(size)
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(size[0], size[1], 3), dtype=np.uint8)
+        super().__init__(env)
         self.unwrapped.original_obs = None
+
+    def transform_space(self, space: gym.spaces.Box) -> gym.spaces.Box:
+        return gym.spaces.Box(low=0, high=255, shape=(self.size[0], self.size[1], 3), dtype=np.uint8)
 
     def resize(self, obs: np.ndarray):
         img = Image.fromarray(obs)
         img = img.resize(self.size, Image.BILINEAR)
         return np.array(img)
 
-    def observation(self, observation: np.ndarray) -> np.ndarray:
+    def transform_image(self, image: np.ndarray) -> np.ndarray:
+        return self.resize(image)
+
+    def observation(self, observation):
         self.unwrapped.original_obs = observation
-        return self.resize(observation)
+        return super().observation(observation)
 
 
 class NoopResetEnv(gym.Wrapper):

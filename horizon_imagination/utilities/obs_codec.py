@@ -6,13 +6,40 @@ import numpy as np
 import torch
 from tensordict.tensordict import TensorDict
 
-from horizon_imagination.utilities.types import ObsKey, Modality
+from horizon_imagination.utilities.types import ObsKey, Modality, image_keys
 from horizon_imagination.utilities.ycbcr import YCbCrTensor
 
 
-RGB_KEY = ObsKey.from_parts(Modality.image, "features")
-Y_KEY = ObsKey.from_parts(Modality.image, "features_y")
-CBCR_KEY = ObsKey.from_parts(Modality.image, "features_cbcr")
+def y_key(rgb_key: ObsKey) -> ObsKey:
+    return ObsKey.from_parts(Modality.image, f"{ObsKey(rgb_key).name}_y")
+
+
+def cbcr_key(rgb_key: ObsKey) -> ObsKey:
+    return ObsKey.from_parts(Modality.image, f"{ObsKey(rgb_key).name}_cbcr")
+
+
+def rgb_key_of(component_key: ObsKey) -> ObsKey | None:
+    """The RGB key a '<name>_y' / '<name>_cbcr' component belongs to, if any."""
+    name = ObsKey(component_key).name
+    for suffix in ('_y', '_cbcr'):
+        if name.endswith(suffix):
+            return ObsKey.from_parts(Modality.image, name[:-len(suffix)])
+    return None
+
+
+def rgb_keys(obs_keys) -> list[ObsKey]:
+    """The RGB image keys of an observation, i.e. image keys that are not YCbCr components."""
+    return [k for k in image_keys(obs_keys) if rgb_key_of(k) is None]
+
+
+def ycbcr_source_keys(obs_keys) -> list[ObsKey]:
+    """The RGB keys reconstructible from the '_y'/'_cbcr' components present in an observation."""
+    keys = set(map(str, obs_keys))
+    return [
+        k for k in image_keys(obs_keys)
+        if (rgb := rgb_key_of(k)) is not None and str(y_key(rgb)) in keys and str(cbcr_key(rgb)) in keys
+        and k == y_key(rgb)
+    ]
 
 
 def _to_mapping(obs: Mapping | TensorDict) -> dict:
@@ -31,38 +58,42 @@ def rgb_to_ycbcr_obs(
     drop_rgb: bool = True,
 ):
     data = _to_mapping(obs)
-    if RGB_KEY not in data:
+    keys = rgb_keys(data.keys())
+    if not keys:
         return obs
 
-    ycbcr = YCbCrTensor.from_rgb(data[RGB_KEY], ratio=ratio, as_uint8=True)
-    data[Y_KEY] = ycbcr._tensors["y"]
-    data[CBCR_KEY] = torch.cat([ycbcr._tensors["cb"], ycbcr._tensors["cr"]], dim=-3)
-    if drop_rgb:
-        del data[RGB_KEY]
+    for key in keys:
+        ycbcr = YCbCrTensor.from_rgb(data[key], ratio=ratio, as_uint8=True)
+        data[y_key(key)] = ycbcr._tensors["y"]
+        data[cbcr_key(key)] = torch.cat([ycbcr._tensors["cb"], ycbcr._tensors["cr"]], dim=-3)
+        if drop_rgb:
+            del data[key]
 
     return _restore_type(obs, data)
 
 
 def ycbcr_to_rgb_obs(obs: Mapping | TensorDict, drop_ycbcr: bool = False):
     data = _to_mapping(obs)
-    has_components = Y_KEY in data and CBCR_KEY in data
-    if not has_components:
+    keys = ycbcr_source_keys(data.keys())
+    if not keys:
         return obs
 
-    cbcr = data[CBCR_KEY]
-    cb, cr = cbcr[..., 0:1, :, :], cbcr[..., 1:2, :, :]
-    rgb = YCbCrTensor(data[Y_KEY], cb, cr).to_rgb().round().to(torch.uint8)
-    data[RGB_KEY] = rgb
-    if drop_ycbcr:
-        del data[Y_KEY]
-        del data[CBCR_KEY]
+    for key in keys:
+        rgb = rgb_key_of(key)
+        cbcr = data[cbcr_key(rgb)]
+        cb, cr = cbcr[..., 0:1, :, :], cbcr[..., 1:2, :, :]
+        data[rgb] = YCbCrTensor(data[y_key(rgb)], cb, cr).to_rgb().round().to(torch.uint8)
+        if drop_ycbcr:
+            del data[y_key(rgb)]
+            del data[cbcr_key(rgb)]
 
     return _restore_type(obs, data)
 
 
-def get_rgb_tensor(obs: Mapping | TensorDict) -> torch.Tensor:
+def get_rgb_tensors(obs: Mapping | TensorDict) -> dict[ObsKey, torch.Tensor]:
+    """The RGB tensor of every image key, decoding YCbCr components where needed."""
     obs_rgb = ycbcr_to_rgb_obs(obs, drop_ycbcr=False)
-    return obs_rgb[RGB_KEY]
+    return {k: obs_rgb[k] for k in rgb_keys(obs_rgb.keys())}
 
 
 def rgb_to_ycbcr_obs_np(
@@ -78,12 +109,10 @@ def rgb_to_ycbcr_obs_np(
     internally to reuse ``YCbCrTensor``.
     """
     data = dict(obs)
-    if RGB_KEY not in data:
-        return data
-
-    ycbcr = YCbCrTensor.from_rgb(torch.from_numpy(data[RGB_KEY]), ratio=ratio, as_uint8=True)
-    data[Y_KEY] = ycbcr._tensors["y"].numpy()
-    data[CBCR_KEY] = torch.cat([ycbcr._tensors["cb"], ycbcr._tensors["cr"]], dim=-3).numpy()
-    del data[RGB_KEY]
+    for key in rgb_keys(data.keys()):
+        ycbcr = YCbCrTensor.from_rgb(torch.from_numpy(data[key]), ratio=ratio, as_uint8=True)
+        data[y_key(key)] = ycbcr._tensors["y"].numpy()
+        data[cbcr_key(key)] = torch.cat([ycbcr._tensors["cb"], ycbcr._tensors["cr"]], dim=-3).numpy()
+        del data[key]
 
     return data

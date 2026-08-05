@@ -4,7 +4,8 @@ import episodata as ed
 from episodata.utils import batch_to_tensordict
 from collections import deque
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
-from horizon_imagination.utilities.obs_codec import get_rgb_tensor
+from horizon_imagination.utilities.obs_codec import get_rgb_tensors
+from horizon_imagination.utilities.types import vector_keys
 
 
 def infinite_loader(loader):
@@ -43,7 +44,7 @@ class EpochDataIterator(Configurable):
         # this fast on a zarr-backed replay buffer.
         tok_stream = self.config.replay_buffer.segment_stream(
             sequence_length=1,
-            fields=['image|features_y', 'image|features_cbcr'],
+            fields=self.config.replay_buffer.schema.field_keys(role='observation'),
             batch_size=self.config.tokenizer_batch_size,
             read_chunk_size=self.config.read_chunk_size,
             # sampler=  TODO: implement the staleness sampler for identical behavior to the existing version
@@ -70,8 +71,12 @@ class EpochDataIterator(Configurable):
         def prefetch_tok():
             batch = batch_to_tensordict(next(tok_iter), device='cuda', include_all_observations=True)
             batch = batch['observation']
-            batch = get_rgb_tensor(batch)[:, 0]
-            buffer.append(batch)
+            # The obs encoders consume raw observations, one entry per key: RGB images
+            # (decoded from their YCbCr components) and raw vectors, without the
+            # singleton time dim of the length-1 segments.
+            obs = {k: v[:, 0] for k, v in get_rgb_tensors(batch).items()}
+            obs.update({k: batch[k][:, 0] for k in vector_keys(batch.keys())})
+            buffer.append(obs)
 
         def prefetch_wm():
             batch = batch_to_tensordict(next(wm_iter), device='cuda', alignment="action_out")

@@ -1,8 +1,10 @@
 from typing import Literal
 import gymnasium as gym
 
-from horizon_imagination.utilities.types import Modality
-from horizon_imagination.modules.transform import PerModalityTransform, ImageLatentToVecTransform
+from horizon_imagination.utilities.types import Modality, vector_keys
+from horizon_imagination.modules.transform import (
+    PerModalityTransform, ImageLatentToVecTransform, VectorLatentToVecTransform
+)
 from horizon_imagination.models.controller import Controller, ActorCritic, DiscreteActorHead, CriticHead
 from horizon_imagination.modules.lightweight_seq_model import LightweightSeqModel
 from horizon_imagination.utilities import AdamWConfig
@@ -10,9 +12,12 @@ from horizon_imagination.utilities import AdamWConfig
 
 def _get_actor_critic_cfg(
         env_name: str,
-        action_space: gym.spaces.Discrete, 
+        action_space: gym.spaces.Discrete,
         tokenizer_channels: int,
-        device, 
+        latent_spatial_shape: tuple[int, int],
+        vector_autoencoder,
+        vector_obs_keys: list,
+        device,
         dtype
     ):
     # Config values only:
@@ -32,6 +37,7 @@ def _get_actor_critic_cfg(
                 learned_per_modality_transforms={
                     Modality.image: ImageLatentToVecTransform.Config(
                         in_channels=tokenizer_channels,
+                        latent_spatial_shape=latent_spatial_shape,
                         out_dim=latent_dim,
                         cnn_base_channels=cnn_base_channels,
                         cnn_out_channels=cnn_out_channels,
@@ -40,7 +46,17 @@ def _get_actor_critic_cfg(
                         device=device,
                         dtype=dtype
                     ).make_instance()
-                }
+                },
+                learned_per_key_transforms={
+                    k: VectorLatentToVecTransform.Config(
+                        latent_dim=vector_autoencoder.config.latent_dim,
+                        num_tokens=vector_autoencoder.num_tokens(k),
+                        out_dim=latent_dim,
+                        device=device,
+                        dtype=dtype
+                    ).make_instance()
+                    for k in vector_obs_keys
+                },
             ),
             latent_dim=latent_dim,
             num_layers=num_lstm_layers,
@@ -73,12 +89,15 @@ def _get_actor_critic_cfg(
 
 def get_controller_config(
         env_name: str,
-        action_space: gym.spaces.Discrete, 
+        obs_space: gym.spaces.Dict,
+        action_space: gym.spaces.Discrete,
         tokenizer_channels: int,
+        latent_spatial_shape: tuple[int, int],
         world_model,
+        vector_autoencoder,
         imagination_horizon: int,
         budget: int,
-        device, 
+        device,
         dtype,
         baseline: Literal['hi', 'ar', 'naive'] = 'hi',
     ):
@@ -96,6 +115,9 @@ def get_controller_config(
         env_name=env_name,
         action_space=action_space,
         tokenizer_channels=tokenizer_channels,
+        latent_spatial_shape=latent_spatial_shape,
+        vector_autoencoder=vector_autoencoder,
+        vector_obs_keys=vector_keys(obs_space.spaces.keys()),
         device=device,
         dtype=dtype
     )

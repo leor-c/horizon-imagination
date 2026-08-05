@@ -8,6 +8,22 @@ from horizon_imagination.diffusion.noise import NoiseBase, UniformNoise, Gaussia
 from horizon_imagination.utilities import MaskedMSELoss
 
 
+def _data_device(x_clean):
+    """
+    The device the data lives on.
+
+    A TensorDict may report ``device=None`` while its leaves are all on the GPU --
+    which is what ``batch_to_tensordict`` produces for the nested 'all_observations'
+    -- so falling back to ``x_clean.device`` alone would sample the diffusion time on
+    the CPU and break the arithmetic below.
+    """
+    if x_clean.device is not None:
+        return x_clean.device
+    if isinstance(x_clean, TensorDict):
+        return next(iter(x_clean.values())).device
+    return None
+
+
 def _preprocess_time_steps(time_steps: Tensor, target_shape):
     if time_steps.dim() < len(target_shape):
         assert time_steps.shape == target_shape[:time_steps.dim()], \
@@ -34,22 +50,29 @@ class RectifiedFlow(DiffusionBase):
             denoiser: DenoiserBase, 
             denoiser_kwargs: dict,
             mask: Tensor = None,
+            loss_weights: dict = None,
             **kwargs,
         ) -> Tensor:
         """
         :param mask: Assume mask is a boolean tensor with values of 1 for valid places and 0 for invalid places that
          should not participate in the loss.
+        :param loss_weights: optional per-observation-key weight (default 1). The per-key
+         loss is a *mean*, so without weights a small vector latent counts as much as a
+         whole image latent.
         """
-        t = self.time_sampler.sample(x_clean.shape[:time_dims], device=x_clean.device, dtype=x_clean.dtype)
+        t = self.time_sampler.sample(
+            x_clean.shape[:time_dims], device=_data_device(x_clean), dtype=x_clean.dtype
+        )
         x_t, noise = self.get_noisy_samples(x_clean, t)
-        
+
         denoiser_outputs, state = denoiser(x_t, t, **denoiser_kwargs)
 
         v_t = x_clean - noise
 
+        loss_weights = loss_weights or {}
         loss_fn = MaskedMSELoss()
         loss = torch.sum(torch.stack([
-            loss_fn(denoiser_outputs[k].float(), v_t[k].float(), mask=mask) 
+            loss_weights.get(k, 1.0) * loss_fn(denoiser_outputs[k].float(), v_t[k].float(), mask=mask)
             for k in x_clean.keys()
         ]))
 

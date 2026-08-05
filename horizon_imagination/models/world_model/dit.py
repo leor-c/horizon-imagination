@@ -46,7 +46,10 @@ from horizon_imagination.utilities.config import Configurable, BaseConfig
 
 from collections import namedtuple
 
-VideoSize = namedtuple("VideoSize", ["T", "H", "W"])
+# A frame is K tokens: image patches (H'*W' of them per image observation key) plus
+# one token per "patch" of every vector observation key. The DiT only ever needs the
+# token count per frame -- the spatial layout lives in the RoPE position table.
+TokenLayout = namedtuple("TokenLayout", ["T", "K"])
 
 
 class RMSNorm(torch.nn.Module):
@@ -224,11 +227,11 @@ class KVCache:
         return self.length
 
 
-def _kv_cache_integration(k, v, video_size: VideoSize, kv_cache: Optional[LayerKVCache] = None):
-    h, w = video_size.H, video_size.W
+def _kv_cache_integration(k, v, token_layout: TokenLayout, kv_cache: Optional[LayerKVCache] = None):
+    tokens_per_frame = token_layout.K
     new_cache = LayerKVCache(
-        rearrange(k, 'B (t h w) ... -> B t (h w) ...', h=h, w=w),
-        rearrange(v, 'B (t h w) ... -> B t (h w) ...', h=h, w=w),
+        rearrange(k, 'B (t k) ... -> B t k ...', k=tokens_per_frame),
+        rearrange(v, 'B (t k) ... -> B t k ...', k=tokens_per_frame),
     )
 
     if kv_cache is not None:
@@ -239,8 +242,8 @@ def _kv_cache_integration(k, v, video_size: VideoSize, kv_cache: Optional[LayerK
 
 
 @lru_cache(maxsize=64)
-def _make_block_causal_mask(h: int, w: int, q_seq_len: int, k_seq_len: int, device):
-    frame_numel = h * w
+def _make_block_causal_mask(tokens_per_frame: int, q_seq_len: int, k_seq_len: int, device):
+    frame_numel = tokens_per_frame
     assert (q_seq_len % frame_numel == 0) and (k_seq_len % frame_numel == 0), \
     f"got {q_seq_len} or {k_seq_len} % {frame_numel} != 0"
 
@@ -409,13 +412,13 @@ class Attention(nn.Module):
         return q, k, v
 
     def compute_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, video_size: Optional[VideoSize] = None
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, token_layout: Optional[TokenLayout] = None
     ) -> torch.Tensor:
         # [B S H D]
-        assert video_size is not None
+        assert token_layout is not None
         k_length, q_length = k.shape[1], q.shape[1]
         assert k_length >= q_length, f"got {k_length} < {q_length}"
-        mask = _make_block_causal_mask(video_size.H, video_size.W, q_length, k_length, q.device)
+        mask = _make_block_causal_mask(token_layout.K, q_length, k_length, q.device)
 
         with torch.autocast("cuda", enabled=False):
             result = torch_attention_op(q.float(), k.float(), v.float(), attn_mask=mask)  # [B, S, H, D]
@@ -426,7 +429,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
-        video_size: Optional[VideoSize] = None,
+        token_layout: Optional[TokenLayout] = None,
         kv_cache: Optional[LayerKVCache] = None
     ) -> tuple[torch.Tensor, LayerKVCache]:
         """
@@ -434,11 +437,11 @@ class Attention(nn.Module):
             x (Tensor): The query tensor of shape [B, Mq, K]
             context (Optional[Tensor]): The key tensor of shape [B, Mk, K] or use x as context [self attention] if None
             rope_emb (Optional[Tensor]): RoPE embedding tensor, or no RoPE embeddings (i.e. in cross attention)
-            video_size(VideoSize): Shape [T, H, W]
+            token_layout(TokenLayout): Shape [T, K]
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        new_kv_cache, k, v = _kv_cache_integration(k, v, video_size, kv_cache)
-        return self.compute_attention(q, k, v, video_size=video_size), new_kv_cache
+        new_kv_cache, k, v = _kv_cache_integration(k, v, token_layout, kv_cache)
+        return self.compute_attention(q, k, v, token_layout=token_layout), new_kv_cache
 
 
 class VideoPositionEmb(nn.Module):
@@ -450,18 +453,18 @@ class VideoPositionEmb(nn.Module):
     def seq_dim(self) -> int:
         return 1
 
-    def forward(self, x_B_T_H_W_C: torch.Tensor, offset: int = 0) -> torch.Tensor:
+    def forward(self, x_B_T_K_C: torch.Tensor, token_positions: torch.Tensor, offset: int = 0) -> torch.Tensor:
         """
         With CP, the function assume that the input tensor is already split.
         It delegates the embedding generation to generate_embeddings function.
         """
-        B_T_H_W_C = x_B_T_H_W_C.shape
+        B_T_K_C = x_B_T_K_C.shape
 
-        embeddings = self.generate_embeddings(B_T_H_W_C, offset=offset)
+        embeddings = self.generate_embeddings(B_T_K_C, token_positions, offset=offset)
 
         return embeddings
 
-    def generate_embeddings(self, B_T_H_W_C: torch.Size, offset: int = 0) -> Any:
+    def generate_embeddings(self, B_T_K_C: torch.Size, token_positions: torch.Tensor, offset: int = 0) -> Any:
         raise NotImplementedError
 
 
@@ -521,7 +524,8 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
     def generate_embeddings(
         self,
-        B_T_H_W_C: torch.Size,
+        B_T_K_C: torch.Size,
+        token_positions: torch.Tensor,
         offset: int = 0,
         h_ntk_factor: Optional[float] = None,
         w_ntk_factor: Optional[float] = None,
@@ -531,8 +535,11 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         Generate embeddings for the given input size.
 
         Args:
-            B_T_H_W_C (torch.Size): Input tensor size (Batch, Time, Height, Width, Channels).
-            fps (Optional[torch.Tensor], optional): Frames per second. Defaults to None.
+            B_T_K_C (torch.Size): Input tensor size (Batch, Time, Tokens per frame, Channels).
+            token_positions (torch.Tensor): (K, 2) integer table giving the (h, w) spatial
+                position of every token of a frame. Image patches take the positions of their
+                cell in the patch grid, so a purely-image observation reproduces the row-major
+                meshgrid this used to hardcode -- and hence bit-identical embeddings.
             h_ntk_factor (Optional[float], optional): Height NTK factor. If None, uses self.h_ntk_factor.
             w_ntk_factor (Optional[float], optional): Width NTK factor. If None, uses self.w_ntk_factor.
             t_ntk_factor (Optional[float], optional): Time NTK factor. If None, uses self.t_ntk_factor.
@@ -540,7 +547,9 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         Returns:
             Not specified in the original code snippet.
         """
-        B, T, H, W, _ = B_T_H_W_C
+        B, T, K, _ = B_T_K_C
+        assert token_positions.shape == (K, 2), \
+            f"Got token positions of shape {tuple(token_positions.shape)}, expected {(K, 2)}"
 
         if T + offset > self.max_t:
             self.max_t = T + offset
@@ -558,26 +567,27 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         w_spatial_freqs = 1.0 / (w_theta**self.dim_spatial_range)
         temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
 
-
+        h_pos, w_pos = token_positions[:, 0], token_positions[:, 1]
         assert (
-            H <= self.max_h and W <= self.max_w
-        ), f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
-        half_emb_h = torch.outer(self.seq[:H], h_spatial_freqs)
-        half_emb_w = torch.outer(self.seq[:W], w_spatial_freqs)
+            int(h_pos.max()) < self.max_h and int(w_pos.max()) < self.max_w
+        ), (f"Token positions (h={int(h_pos.max())}, w={int(w_pos.max())}) exceed the maximum "
+            f"dimensions (max_h={self.max_h}, max_w={self.max_w})")
+        half_emb_h = torch.outer(self.seq[h_pos], h_spatial_freqs)  # (K, d)
+        half_emb_w = torch.outer(self.seq[w_pos], w_spatial_freqs)  # (K, d)
 
         half_emb_t = torch.outer(self.seq[offset:offset + T], temporal_freqs)
 
-        em_T_H_W_D = torch.cat(
+        em_T_K_D = torch.cat(
             [
-                repeat(half_emb_t, "t d -> t h w d", h=H, w=W),
-                repeat(half_emb_h, "h d -> t h w d", t=T, w=W),
-                repeat(half_emb_w, "w d -> t h w d", t=T, h=H),
+                repeat(half_emb_t, "t d -> t k d", k=K),
+                repeat(half_emb_h, "k d -> t k d", t=T),
+                repeat(half_emb_w, "k d -> t k d", t=T),
             ]
             * 2,
             dim=-1,
         )
 
-        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+        return rearrange(em_T_K_D, "t k d -> (t k) 1 1 d").float()
 
     @property
     def seq_dim(self) -> int:
@@ -880,7 +890,7 @@ class FinalLayer(nn.Module):
 
     def forward(
         self,
-        x_B_T_H_W_D: torch.Tensor,
+        x_B_T_K_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
     ):
@@ -892,24 +902,24 @@ class FinalLayer(nn.Module):
         else:
             shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        shift_B_T_1_1_D, scale_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d"), rearrange(
-            scale_B_T_D, "b t d -> b t 1 1 d"
+        shift_B_T_1_D, scale_B_T_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 d"), rearrange(
+            scale_B_T_D, "b t d -> b t 1 d"
         )
 
         def _fn(
-            _x_B_T_H_W_D: torch.Tensor,
+            _x_B_T_K_D: torch.Tensor,
             _norm_layer: nn.Module,
-            _scale_B_T_1_1_D: torch.Tensor,
-            _shift_B_T_1_1_D: torch.Tensor,
+            _scale_B_T_1_D: torch.Tensor,
+            _shift_B_T_1_D: torch.Tensor,
         ) -> torch.Tensor:
-            return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
+            return _norm_layer(_x_B_T_K_D) * (1 + _scale_B_T_1_D) + _shift_B_T_1_D
 
-        x_B_T_H_W_D = _fn(x_B_T_H_W_D, self.layer_norm, scale_B_T_1_1_D, shift_B_T_1_1_D)
+        x_B_T_K_D = _fn(x_B_T_K_D, self.layer_norm, scale_B_T_1_D, shift_B_T_1_D)
         if self.linear is not None:
-            x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
+            x_B_T_K_O = self.linear(x_B_T_K_D)
         else:
-            x_B_T_H_W_O = x_B_T_H_W_D
-        return x_B_T_H_W_O
+            x_B_T_K_O = x_B_T_K_D
+        return x_B_T_K_O
 
 
 class Block(nn.Module):
@@ -998,7 +1008,7 @@ class Block(nn.Module):
 
     def forward(
         self,
-        x_B_T_H_W_D: torch.Tensor,
+        x_B_T_K_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
@@ -1006,7 +1016,7 @@ class Block(nn.Module):
         kv_cache: Optional[LayerKVCache] = None,
     ) -> tuple[torch.Tensor, LayerKVCache]:
         if extra_per_block_pos_emb is not None:
-            x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
+            x_B_T_K_D = x_B_T_K_D + extra_per_block_pos_emb
 
         if self.use_adaln_lora:
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
@@ -1021,55 +1031,53 @@ class Block(nn.Module):
             ).chunk(3, dim=-1)
             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
 
-        # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
-        shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
-        scale_self_attn_B_T_1_1_D = rearrange(scale_self_attn_B_T_D, "b t d -> b t 1 1 d")
-        gate_self_attn_B_T_1_1_D = rearrange(gate_self_attn_B_T_D, "b t d -> b t 1 1 d")
+        # Reshape tensors from (B, T, D) to (B, T, 1, D) for broadcasting over the frame's tokens
+        shift_self_attn_B_T_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 d")
+        scale_self_attn_B_T_1_D = rearrange(scale_self_attn_B_T_D, "b t d -> b t 1 d")
+        gate_self_attn_B_T_1_D = rearrange(gate_self_attn_B_T_D, "b t d -> b t 1 d")
 
-        shift_mlp_B_T_1_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 1 d")
-        scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d")
-        gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d")
+        shift_mlp_B_T_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 d")
+        scale_mlp_B_T_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 d")
+        gate_mlp_B_T_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 d")
 
-        B, T, H, W, D = x_B_T_H_W_D.shape
+        B, T, K, D = x_B_T_K_D.shape
 
-        def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
-            return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
+        def _fn(_x_B_T_K_D, _norm_layer, _scale_B_T_1_D, _shift_B_T_1_D):
+            return _norm_layer(_x_B_T_K_D) * (1 + _scale_B_T_1_D) + _shift_B_T_1_D
 
-        normalized_x_B_T_H_W_D = _fn(
-            x_B_T_H_W_D,
+        normalized_x_B_T_K_D = _fn(
+            x_B_T_K_D,
             self.layer_norm_self_attn,
-            scale_self_attn_B_T_1_1_D,
-            shift_self_attn_B_T_1_1_D,
+            scale_self_attn_B_T_1_D,
+            shift_self_attn_B_T_1_D,
         )
 
-        video_size = VideoSize(T=T, H=H, W=W)
+        token_layout = TokenLayout(T=T, K=K)
 
-        result_B_T_H_W_D, new_kv_cache = self.self_attn(
-            # normalized_x_B_T_HW_D,
-            rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+        result_B_T_K_D, new_kv_cache = self.self_attn(
+            rearrange(normalized_x_B_T_K_D, "b t k d -> b (t k) d"),
             None,
             rope_emb=rope_emb_L_1_1_D,
-            video_size=video_size,
+            token_layout=token_layout,
             kv_cache=kv_cache,
         )
-        result_B_T_H_W_D = rearrange(
-            result_B_T_H_W_D,
-            "b (t h w) d -> b t h w d",
+        result_B_T_K_D = rearrange(
+            result_B_T_K_D,
+            "b (t k) d -> b t k d",
             t=T,
-            h=H,
-            w=W,
+            k=K,
         )
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
+        x_B_T_K_D = x_B_T_K_D + gate_self_attn_B_T_1_D * result_B_T_K_D
 
-        normalized_x_B_T_H_W_D = _fn(
-            x_B_T_H_W_D,
+        normalized_x_B_T_K_D = _fn(
+            x_B_T_K_D,
             self.layer_norm_mlp,
-            scale_mlp_B_T_1_1_D,
-            shift_mlp_B_T_1_1_D,
+            scale_mlp_B_T_1_D,
+            shift_mlp_B_T_1_D,
         )
-        result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
-        return x_B_T_H_W_D, new_kv_cache
+        result_B_T_K_D = self.mlp(normalized_x_B_T_K_D)
+        x_B_T_K_D = x_B_T_K_D + gate_mlp_B_T_1_D * result_B_T_K_D
+        return x_B_T_K_D, new_kv_cache
 
 
 class MiniTrainDIT(nn.Module):
@@ -1228,6 +1236,10 @@ class MiniTrainDIT(nn.Module):
 
     def build_pos_embed(self) -> None:
         assert self.pos_emb_cls == "rope3d"
+        # LearnablePosEmbAxis assumes a full (T, H, W) grid of tokens, which a
+        # multi-key observation is not (see the token position table).
+        assert not self.extra_per_block_abs_pos_emb, \
+            "extra_per_block_abs_pos_emb is not supported with the (B, T, K, D) token layout."
 
         kwargs = dict(
             model_channels=self.model_channels,
@@ -1255,7 +1267,8 @@ class MiniTrainDIT(nn.Module):
 
     def prepare_embedded_sequence(
         self,
-        x_B_T_H_W_D: torch.Tensor,
+        x_B_T_K_D: torch.Tensor,
+        token_positions: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
@@ -1279,24 +1292,20 @@ class MiniTrainDIT(nn.Module):
             - Otherwise, the positional embeddings are generated without considering fps.
         """
         # Patchify:
-        # x_B_T_H_W_D = self.x_embedder(x_B_T_C_H_W)
+        # x_B_T_K_D = self.x_embedder(x_B_T_C_H_W)
 
-        if self.extra_per_block_abs_pos_emb:
-            extra_pos_emb = self.extra_pos_embedder(x_B_T_H_W_D)
-        else:
-            extra_pos_emb = None
+        extra_pos_emb = None  # see the assert in build_pos_embed
 
         offset = 0
         if kv_cache is not None:
-            _, _, H, W, _ = x_B_T_H_W_D.shape
-            frame_numel = H * W
-            offset = kv_cache.layers_kv_caches[0].keys.shape[1]  # // frame_numel
-        pos_embedder_out = self.pos_embedder(x_B_T_H_W_D, offset=offset)
+            # The cache is stored per frame, so its length is already a frame count.
+            offset = kv_cache.layers_kv_caches[0].keys.shape[1]
+        pos_embedder_out = self.pos_embedder(x_B_T_K_D, token_positions, offset=offset)
         if "rope" in self.pos_emb_cls.lower():
-            return x_B_T_H_W_D, pos_embedder_out, extra_pos_emb
-        x_B_T_H_W_D = x_B_T_H_W_D + pos_embedder_out  # [B, T, H, W, D]
+            return x_B_T_K_D, pos_embedder_out, extra_pos_emb
+        x_B_T_K_D = x_B_T_K_D + pos_embedder_out  # [B, T, K, D]
 
-        return x_B_T_H_W_D, None, extra_pos_emb
+        return x_B_T_K_D, None, extra_pos_emb
 
     def unpatchify(self, x_B_T_H_W_M: torch.Tensor) -> torch.Tensor:
         x_B_Tt_C_Hp_Wp = rearrange(
@@ -1310,21 +1319,23 @@ class MiniTrainDIT(nn.Module):
 
     def forward(
         self,
-        x_B_T_H_W_D: torch.Tensor,
+        x_B_T_K_D: torch.Tensor,
         timesteps_B_T: torch.Tensor,
+        token_positions: torch.Tensor,
         condition_emb: torch.Tensor = None,
         kv_cache: Optional[KVCache] = None,
     ) -> tuple[torch.Tensor, KVCache] | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
-            x: (B, C, T, H, W) tensor of spatial-temp inputs
+            x: (B, T, K, D) tensor of the frames' tokens
             timesteps: (B, T) tensor of timesteps
+            token_positions: (K, 2) table of the (h, w) RoPE position of every token of a frame
             condition_emb: (B, T, D) tensor of an additional conditioning signal
             kv_cache: ModelState (optional) an object that contains per-layer KV caches of previous
             inputs.
         """
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
-            x_B_T_H_W_D, kv_cache
+        x_B_T_K_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_K_D = self.prepare_embedded_sequence(
+            x_B_T_K_D, token_positions, kv_cache
         )
 
         if timesteps_B_T.ndim == 1:
@@ -1338,34 +1349,32 @@ class MiniTrainDIT(nn.Module):
         c_B_T_D, adaln_lora_B_T_3D = self.c_embedder(c_B_T_D)
         c_B_T_D = self.t_embedding_norm(c_B_T_D)
 
-        if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+        if extra_pos_emb_B_T_K_D is not None:
             assert (
-                x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
-            ), f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
+                x_B_T_K_D.shape == extra_pos_emb_B_T_K_D.shape
+            ), f"{x_B_T_K_D.shape} != {extra_pos_emb_B_T_K_D.shape}"
 
         blocks = self.blocks
 
         block_kwargs = {
             "rope_emb_L_1_1_D": rope_emb_L_1_1_D,
             "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
-            "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+            "extra_per_block_pos_emb": extra_pos_emb_B_T_K_D,
         }
         block_kv_caches = []
         for i, block in enumerate(blocks):
             if kv_cache is not None:
                 block_kwargs['kv_cache'] = kv_cache.layers_kv_caches[i]
 
-            x_B_T_H_W_D, block_kv_cache = block(
-                x_B_T_H_W_D,
+            x_B_T_K_D, block_kv_cache = block(
+                x_B_T_K_D,
                 c_B_T_D,
                 **block_kwargs,
             )
             block_kv_caches.append(block_kv_cache)
 
-        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, c_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
-        # x_B_Tt_C_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
-        # return x_B_Tt_C_Hp_Wp, KVCache(block_kv_caches)
-        return x_B_T_H_W_O, KVCache(block_kv_caches)
+        x_B_T_K_O = self.final_layer(x_B_T_K_D, c_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        return x_B_T_K_O, KVCache(block_kv_caches)
 
 
 class DiT(nn.Module, Configurable):
@@ -1390,7 +1399,7 @@ class DiT(nn.Module, Configurable):
         rope_w_extrapolation_ratio: float = 1.0
         rope_t_extrapolation_ratio: float = 1.0
         device: torch.device = torch.device('cuda')
-        ln_eps: float = 1e-5,
+        ln_eps: float = 1e-5
 
     def __init__(self, config: Config):
         super().__init__()
@@ -1415,10 +1424,18 @@ class DiT(nn.Module, Configurable):
             ln_eps=config.ln_eps,
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor, kv_cache: Optional[KVCache] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        c: torch.Tensor,
+        token_positions: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+    ):
         return self.model.forward(
-            x_B_T_H_W_D=x,
+            x_B_T_K_D=x,
             timesteps_B_T=t,
+            token_positions=token_positions,
             condition_emb=c,
             kv_cache=kv_cache,
         )

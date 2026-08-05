@@ -1,1 +1,3 @@
 from horizon_imagination.models.tokenizer.cosmos import CosmosImageTokenizer
+from horizon_imagination.models.tokenizer.vector import VectorAutoencoder, VectorKeySpec
+from horizon_imagination.models.tokenizer.obs_encoder_stack import ObsEncoderStack

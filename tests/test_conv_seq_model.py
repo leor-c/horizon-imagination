@@ -71,6 +71,41 @@ def test_state_threading_equivalence():
     print("test_state_threading_equivalence OK")
 
 
+IMG_KEY_B = ObsKey.from_parts(Modality.image, 'wrist')
+VEC_KEY = ObsKey.from_parts(Modality.vector, 'proprio')
+
+
+def _make_multi_modal_obs(b, t, c=4, h=4, w=4, latent_dim=8, num_tokens=2):
+    return TensorDict({
+        IMG_KEY: torch.randn(b, t, c, h, w),
+        IMG_KEY_B: torch.randn(b, t, c, h, w),
+        VEC_KEY: torch.randn(b, t, latent_dim, num_tokens, 1),
+    }, batch_size=(b, t))
+
+
+def test_multi_modal_obs_are_concatenated_on_the_channel_dim():
+    # 2 image keys (4 channels each) + a vector key of 8*2 broadcast channels:
+    model = _make_model(in_channels=2 * 4 + 8 * 2)
+    obs = _make_multi_modal_obs(b=2, t=5)
+
+    out, state = model(actions=None, obs=obs, state=None)
+
+    assert out.shape == (2, 5, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_vector_keys_influence_the_output():
+    model = _make_model(in_channels=2 * 4 + 8 * 2).eval()
+    obs = _make_multi_modal_obs(b=2, t=5)
+    out, _ = model(actions=None, obs=obs, state=None)
+
+    perturbed = obs.clone()
+    perturbed[VEC_KEY] = torch.randn_like(perturbed[VEC_KEY])
+    out_perturbed, _ = model(actions=None, obs=perturbed, state=None)
+
+    assert not torch.allclose(out, out_perturbed)
+
+
 def test_reward_done_model_training_step_smoke():
     action_space = gym.spaces.Discrete(4)
     backbone_config = ConvSeqModel.Config(

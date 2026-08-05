@@ -147,6 +147,8 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
         obs_transform: PerModalityTransform = None
         reward_done_model: RewardDoneModel.Config = None
         time_sampler: TimeSamplerBase = BetaTimeSampler()
+        # Per-observation-key weight of the denoiser loss (default 1 for every key):
+        obs_loss_weights: dict = None
 
     def __init__(
             self, 
@@ -195,7 +197,8 @@ class RectifiedFlowWorldModel(L.LightningModule, Configurable):
                 'actions': shifted_action,
                 'state': None
             },
-            mask=mask
+            mask=mask,
+            loss_weights=self.config.obs_loss_weights,
         )
         loss_dict = {'world_model/denoiser_loss': loss}
 

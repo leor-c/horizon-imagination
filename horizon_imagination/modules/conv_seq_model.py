@@ -9,6 +9,13 @@ from horizon_imagination.models.tokenizer.cosmos.modules.layers3d import (
     CausalConv3d, CausalResnetBlockFactorized3d,
 )
 from horizon_imagination.models.tokenizer.cosmos.modules.utils import nonlinearity
+from horizon_imagination.utilities.types import Modality, canonical_obs_keys
+
+
+def _broadcast_to_grid(x: Tensor, h: int, w: int) -> Tensor:
+    """(B, T, D, P, 1) vector latent -> (B, T, D*P, h, w)."""
+    x = x.flatten(start_dim=2)
+    return x[..., None, None].expand(*x.shape, h, w)
 
 
 class ConvSeqModel(nn.Module, Configurable):
@@ -102,15 +109,19 @@ class ConvSeqModel(nn.Module, Configurable):
         obs: TensorDict,
         state: Tensor = None,
     ) -> tuple[Tensor, Tensor]:
-        keys = list(obs.keys())
-        assert len(keys) == 1, \
-            f"ConvSeqModel supports exactly one obs modality, got {keys}"
-        x = obs[keys[0]]  # (B, T, C, H, W)
+        h, w = self.config.latent_spatial_shape
+
+        # Every observation key becomes a channel block of the same spatial grid:
+        # image latents already are (C, H, W); vector latents (D, P, 1) are flattened
+        # to D*P channels and broadcast over the grid, like the action embedding below.
+        x = torch.cat([
+            obs[key] if key.modality == Modality.image else _broadcast_to_grid(obs[key], h, w)
+            for key in canonical_obs_keys(obs.keys())
+        ], dim=2)  # (B, T, C, H, W)
 
         if not self.config.ignore_actions:
             assert actions.dim() == 2, f"Got {actions.shape}"
             act = self.action_emb(actions)  # (B, T, C)
-            h, w = self.config.latent_spatial_shape
             act = act[..., None, None].expand(*act.shape, h, w)
             x = torch.cat([x, act], dim=2)
 
