@@ -33,6 +33,18 @@ from horizon_imagination.models.world_model.action_producer import (
 )
 
 
+def batch_size_of(batch) -> int:
+    """Leading dim of a training batch, whichever shape ``EpochDataIterator`` produced.
+
+    The world model and controller are fed TensorDicts, which carry a batch ``.shape``. The
+    obs encoders are fed a plain ``dict[ObsKey, Tensor]`` of raw per-key observations
+    (``EpochDataIterator.prefetch_tok``), which does not.
+    """
+    if hasattr(batch, 'shape'):
+        return batch.shape[0]
+    return next(iter(batch.values())).shape[0]
+
+
 def _stack_image_keys(frames: list[np.ndarray]) -> np.ndarray:
     """Stack the per-image-key frames (b t h w c) vertically into one video frame."""
     return frames[0] if len(frames) == 1 else np.concatenate(frames, axis=2)
@@ -241,7 +253,7 @@ class Agent(Configurable, L.LightningModule):
         optimizer = self.optimizers()[component_idx]
 
         optimizer.zero_grad()
-        log_fn = partial(self.log_dict, batch_size=batch.shape[0])
+        log_fn = partial(self.log_dict, batch_size=batch_size_of(batch))
         loss = self.components[component_idx].training_step(batch, batch_idx, log_fn)
 
         self.manual_backward(loss)
