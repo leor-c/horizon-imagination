@@ -5,14 +5,17 @@ from horizon_imagination.utilities.types import Modality, vector_keys
 from horizon_imagination.modules.transform import (
     PerModalityTransform, ImageLatentToVecTransform, VectorLatentToVecTransform
 )
-from horizon_imagination.models.controller import Controller, ActorCritic, DiscreteActorHead, CriticHead
+from horizon_imagination.models.controller import (
+    Controller, ActorCritic, DiscreteActorHead, GaussianActorHead, CriticHead
+)
 from horizon_imagination.modules.lightweight_seq_model import LightweightSeqModel
+from horizon_imagination.modules.embeddings import action_dim
 from horizon_imagination.utilities import AdamWConfig
 
 
 def _get_actor_critic_cfg(
         env_name: str,
-        action_space: gym.spaces.Discrete,
+        action_space: gym.Space,
         tokenizer_channels: int,
         latent_spatial_shape: tuple[int, int],
         vector_autoencoder,
@@ -65,6 +68,25 @@ def _get_actor_critic_cfg(
             dtype=dtype
     )
 
+    ac_cfg = ActorCritic.Config(
+        backbone=backbone_cfg,
+        shared_backbone=shared_backbone,
+        use_clean_diffused_actors=use_clean_diffused_actors,
+        actor=_get_actor_head_cfg(env_name, action_space, latent_dim),
+        critic=CriticHead.Config(latent_dim=latent_dim),
+    )
+    return ac_cfg
+
+
+def _get_actor_head_cfg(env_name: str, action_space: gym.Space, latent_dim: int):
+    if isinstance(action_space, gym.spaces.Box):
+        return GaussianActorHead.Config(
+            latent_dim=latent_dim,
+            action_dim=action_dim(action_space),
+        )
+
+    assert isinstance(action_space, gym.spaces.Discrete), f"Got {action_space}"
+
     actor_bias = None
     if 'speleo' in env_name.lower():
         # nop, forward, jump, mouse x+, mouse x-, mouse y+, mouse y-
@@ -73,24 +95,17 @@ def _get_actor_critic_cfg(
         # nop, forward, jump, dig (used to chop), mouse x+, mouse x-, mouse y+, mouse y-
         actor_bias = (0, 0, 0, 1, 0, 0, 0, 0)
 
-    ac_cfg = ActorCritic.Config(
-        backbone=backbone_cfg,
-        shared_backbone=shared_backbone,
-        use_clean_diffused_actors=use_clean_diffused_actors,
-        actor=DiscreteActorHead.Config(
-            latent_dim=latent_dim,
-            actor_bias=actor_bias,
-            num_actions=action_space.n
-        ),
-        critic=CriticHead.Config(latent_dim=latent_dim),
+    return DiscreteActorHead.Config(
+        latent_dim=latent_dim,
+        actor_bias=actor_bias,
+        num_actions=action_space.n
     )
-    return ac_cfg
 
 
 def get_controller_config(
         env_name: str,
         obs_space: gym.spaces.Dict,
-        action_space: gym.spaces.Discrete,
+        action_space: gym.Space,
         tokenizer_channels: int,
         latent_spatial_shape: tuple[int, int],
         world_model,

@@ -10,6 +10,7 @@ from horizon_imagination.models.tokenizer.cosmos.modules.layers3d import (
 )
 from horizon_imagination.models.tokenizer.cosmos.modules.utils import nonlinearity
 from horizon_imagination.utilities.types import Modality, canonical_obs_keys
+from horizon_imagination.modules.embeddings import build_action_embedder
 
 
 def _broadcast_to_grid(x: Tensor, h: int, w: int) -> Tensor:
@@ -55,12 +56,8 @@ class ConvSeqModel(nn.Module, Configurable):
         in_channels = config.in_channels
         self.action_emb = None
         if not config.ignore_actions:
-            assert isinstance(config.action_space, gym.spaces.Discrete)
-            self.action_emb = nn.Embedding(
-                num_embeddings=config.action_space.n,
-                embedding_dim=config.in_channels,
-                device=device,
-                dtype=dtype,
+            self.action_emb = build_action_embedder(
+                config.action_space, config.in_channels, device=device, dtype=dtype,
             )
             in_channels = in_channels * 2
 
@@ -120,7 +117,8 @@ class ConvSeqModel(nn.Module, Configurable):
         ], dim=2)  # (B, T, C, H, W)
 
         if not self.config.ignore_actions:
-            assert actions.dim() == 2, f"Got {actions.shape}"
+            # (B, T) for discrete actions, (B, T, A) for continuous ones:
+            assert actions.dim() in (2, 3), f"Got {actions.shape}"
             act = self.action_emb(actions)  # (B, T, C)
             act = act[..., None, None].expand(*act.shape, h, w)
             x = torch.cat([x, act], dim=2)

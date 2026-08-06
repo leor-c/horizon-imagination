@@ -4,7 +4,7 @@ from typing import Optional, Literal
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.distributions import Distribution, Categorical
+from torch.distributions import Distribution, Categorical, Independent, Normal
 from tensordict.tensordict import TensorDict
 from loguru import logger
 
@@ -17,7 +17,7 @@ class ActorHead(nn.Module, Configurable, ABC):
     @dataclass(kw_only=True)
     class Config(BaseConfig):
         latent_dim: int
-        actor_bias: Optional[tuple[float, ...]] = None,
+        actor_bias: Optional[tuple[float, ...]] = None
         device: torch.device = None
         dtype: torch.dtype = None
 
@@ -57,6 +57,57 @@ class DiscreteActorHead(ActorHead):
         logits = self.head(x)
 
         return Categorical(logits=logits)
+
+
+class GaussianActorHead(ActorHead):
+    """
+    A diagonal-Gaussian policy over a continuous (`Box`) action space.
+
+    The head emits `2 * action_dim` values per step, read as [mean | log_std], so the
+    spread is state-dependent. `Independent(..., 1)` sums the per-dimension log-probs
+    and entropies over the action axis, which keeps `log_prob` and `entropy` shaped
+    (B, T) -- exactly what the actor-critic losses expect from a `Categorical`.
+
+    Actions are unbounded here: the `Box` bounds are enforced once, where the action
+    reaches the environment (see `Controller.collect_data`), which keeps `log_prob`
+    and `entropy` exact rather than needing a squashing correction.
+    """
+
+    @dataclass(kw_only=True)
+    class Config(ActorHead.Config):
+        action_dim: int
+        # Initial spread, applied as the bias of the log_std half of the head. exp(-0.5)
+        # ~ 0.6, a reasonable starting scale for the [-1, 1] boxes that are typical.
+        init_log_std: float = -0.5
+        log_std_min: float = -5.0
+        log_std_max: float = 2.0
+
+    def __init__(self, config: Config, *args, **kwargs):
+        assert config.actor_bias is None, \
+            "actor_bias is a per-env prior over discrete actions; it has no meaning " \
+            "for a Gaussian head, whose output is a [mean | log_std] pair."
+        super().__init__(config, *args, **kwargs)
+
+        # Start with a near state-independent spread: the log_std rows begin at
+        # `init_log_std` and barely respond to the input, so early training explores at
+        # a predictable scale instead of at whatever the random projection produces.
+        with torch.no_grad():
+            self.head.bias[config.action_dim:] = config.init_log_std
+            self.head.weight[config.action_dim:] *= 0.01
+
+    def _build_head(self):
+        return nn.Linear(
+            in_features=self.config.latent_dim,
+            out_features=2 * self.config.action_dim,
+            device=self.config.device,
+            dtype=self.config.dtype,
+        )
+
+    def forward(self, x: Tensor) -> Independent:
+        mean, log_std = self.head(x).chunk(2, dim=-1)
+        std = log_std.clamp(self.config.log_std_min, self.config.log_std_max).exp()
+
+        return Independent(Normal(mean, std), 1)
 
 
 class CriticHead(nn.Module, Configurable):

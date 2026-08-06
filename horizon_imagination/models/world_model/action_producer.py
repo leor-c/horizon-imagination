@@ -120,6 +120,43 @@ class StableDiscreteActionProducer(ActionProducer):
         return a, x.log_prob(a)
     
 
+class StableContinuousActionProducer(ActionProducer):
+    """
+    The continuous counterpart of `StableDiscreteActionProducer`.
+
+    One standard-normal draw `eps` is made on the first call and reused for the rest of
+    the denoising process, so the action is re-derived at every step by the
+    reparameterization `a = mean + std * eps`. Holding `eps` fixed is what makes the
+    sampler *stable*: as the policy distribution drifts across denoising steps the
+    action follows it continuously, instead of jumping to an unrelated point of the
+    action space the way an independent draw per step would.
+
+    The returned action is detached. The actor loss is REINFORCE
+    (`-log_pi(a) * advantage`), whose estimator requires the action to be a constant:
+    substituting a live `a = mean + std * eps` into `log_prob` collapses it to
+    `-eps^2/2 - log(std) - c`, which has *zero* gradient w.r.t. the mean. The
+    reparameterization is used here for its coupling across denoising steps, not for
+    pathwise gradients -- those cannot flow anyway, since the denoiser runs under
+    `torch.no_grad()`.
+    """
+
+    def __init__(self, generator=None):
+        super().__init__()
+        self.generator = generator
+        self.eps = None
+
+    def __call__(self, x: torch.distributions.Independent, *args, **kwargs):
+        mean, std = x.base_dist.loc, x.base_dist.scale
+
+        if self.eps is None:
+            self.eps = torch.randn(
+                mean.shape, device=mean.device, dtype=mean.dtype, generator=self.generator
+            )
+
+        a = (mean + std * self.eps).detach()
+        return a, x.log_prob(a)
+
+
 class StablePseudoPolicyActionProducer(PseudoPolicyActionProducer):
     def __init__(self, actions: Tensor, num_actions, device=None):
         super().__init__(actions, num_actions, device)
@@ -130,11 +167,22 @@ class StablePseudoPolicyActionProducer(PseudoPolicyActionProducer):
         return a, log_p_a
     
 
+def make_stable_action_producer(action_dist, generator=None) -> ActionProducer:
+    """Pick the stable sampler matching the policy's output distribution."""
+    if isinstance(action_dist, torch.distributions.Categorical):
+        return StableDiscreteActionProducer(generator=generator)
+    if isinstance(action_dist, torch.distributions.Independent):
+        return StableContinuousActionProducer(generator=generator)
+
+    raise NotImplementedError(f"No stable sampler for policy distribution {type(action_dist)}.")
+
+
 class StablePolicyActionProducer(ActionProducer):
     def __init__(self, actor_critic):
         super().__init__()
         self.actor_critic = actor_critic
-        self.action_producer = StableDiscreteActionProducer()
+        # Built on the first call, from the distribution the policy actually returns:
+        self.action_producer = None
 
     def __call__(self, x, is_clean=False, *args, t: Tensor = None, **kwargs):
         # TODO: support actions - generate efficiently
@@ -144,6 +192,8 @@ class StablePolicyActionProducer(ActionProducer):
             action_dist, _, _ = self.actor_critic(
                 prev_actions=None, obs=x, compute_critic=False, noise_level=t, *args, **kwargs
             )
+        if self.action_producer is None:
+            self.action_producer = make_stable_action_producer(action_dist)
         a, log_prob_a = self.action_producer(action_dist)
         return a, log_prob_a
     

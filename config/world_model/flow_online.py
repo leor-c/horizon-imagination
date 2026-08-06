@@ -26,7 +26,7 @@ from config.tokenizer.image.cosmos import (
 
 def get_world_model_online_config(
         obs_space: gym.spaces.Dict,
-        action_space: gym.spaces.Discrete,
+        action_space: gym.Space,
         tokenizer_channels: int,
         latent_spatial_shape: tuple[int, int],
         image_tokenizer: CosmosImageTokenizer,

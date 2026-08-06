@@ -1,7 +1,7 @@
 from typing import Literal, Optional
 import lightning as L
 import torch
-import torch.nn.functional as F
+from torch.distributions import Distribution, Categorical, Independent, Normal, kl_divergence
 from einops import rearrange, repeat
 
 import gymnasium as gym
@@ -141,6 +141,51 @@ def compute_original_actor_loss(
     return loss_actor, entropy, advantage
 
 
+def _detach_dist(dist: Distribution) -> Distribution:
+    """A copy of `dist` whose parameters carry no gradient."""
+    if isinstance(dist, Categorical):
+        return Categorical(logits=dist.logits.detach())
+    if isinstance(dist, Independent):
+        base = dist.base_dist
+        assert isinstance(base, Normal), f"Got {type(base)}"
+        return Independent(
+            Normal(base.loc.detach(), base.scale.detach()), dist.reinterpreted_batch_ndims
+        )
+
+    raise NotImplementedError(f"Cannot detach policy distribution {type(dist)}.")
+
+
+def _slice_dist(dist: Distribution, index) -> Distribution:
+    """Index a policy distribution along its batch dims, as if it were a tensor."""
+    if isinstance(dist, Categorical):
+        return Categorical(logits=dist.logits[index])
+    if isinstance(dist, Independent):
+        base = dist.base_dist
+        assert isinstance(base, Normal), f"Got {type(base)}"
+        return Independent(
+            Normal(base.loc[index], base.scale[index]), dist.reinterpreted_batch_ndims
+        )
+
+    raise NotImplementedError(f"Cannot index policy distribution {type(dist)}.")
+
+
+def _cat_dists(dists: list[Distribution], dim: int) -> Distribution:
+    """Concatenate policy distributions of the same family along a batch dim."""
+    first = dists[0]
+    if isinstance(first, Categorical):
+        return Categorical(logits=torch.cat([d.logits for d in dists], dim=dim))
+    if isinstance(first, Independent):
+        return Independent(
+            Normal(
+                torch.cat([d.base_dist.loc for d in dists], dim=dim),
+                torch.cat([d.base_dist.scale for d in dists], dim=dim),
+            ),
+            first.reinterpreted_batch_ndims,
+        )
+
+    raise NotImplementedError(f"Cannot concatenate policy distributions {type(first)}.")
+
+
 def compute_clean_diffused_actor_loss(
         traj_segment,
         lambda_returns,
@@ -152,12 +197,12 @@ def compute_clean_diffused_actor_loss(
         action_dist,
         actor_critic_outs
 ):
-    actions_logits = torch.stack(
-        [
-            torch.cat([action_dist.logits, d.logits], dim=1)
-            for d in actor_critic_outs.actions_dist
-        ], dim=0
-    )[:, :, :-1]
+    # One distribution per denoising step, over the whole (B, T) grid, with the
+    # first (context) step prepended and the last (bootstrap) step dropped:
+    step_dists = [
+        _slice_dist(_cat_dists([action_dist, d], dim=1), (slice(None), slice(None, -1)))
+        for d in actor_critic_outs.actions_dist
+    ]
 
     clean_log_probs = traj_segment['log_pi'][-1, :, :-1]
     advantage = (lambda_returns - values).detach() / returns_scale.to(dtype=values.dtype)
@@ -168,13 +213,25 @@ def compute_clean_diffused_actor_loss(
     valid_mask_blocks = rearrange(valid_mask, '(N B) ... -> N B ...', N=N, B=B)
     loss_actions = loss_actions[torch.where(valid_mask_blocks[-1])].mean()
 
-    noisy_action_logits = actions_logits[:-1]
-    clean_action_logits = actions_logits[-1]
-    targets = repeat(clean_action_logits.detach(), 'B T ... -> N B T ...', N=N - 1)
-    loss_noisy_actions = F.cross_entropy(
-        noisy_action_logits[torch.where(valid_mask_blocks[:-1])].flatten(0, 1),
-        F.softmax(targets[torch.where(valid_mask_blocks[:-1])].flatten(0, 1), dim=-1)
+    # Distill the clean actor into the noisy ones: KL(clean || noisy) per valid step,
+    # with the clean distribution held fixed. Defined for any policy family, unlike the
+    # cross-entropy-on-logits this replaces.
+    #
+    # NOTE this also fixes that older form. It read
+    #   F.cross_entropy(noisy[valid].flatten(0, 1), softmax(clean[valid].flatten(0, 1)))
+    # where `noisy[valid]` is already (num_valid_steps, num_actions), so `flatten(0, 1)`
+    # collapsed it to a single 1-D vector and the softmax ran over every valid step and
+    # action jointly -- one giant distribution over the batch, rather than one
+    # distribution per step. For a Categorical the per-step KL below equals the intended
+    # soft-target cross-entropy up to the constant H(clean), so `loss_actor` shifts by
+    # that constant relative to previous runs.
+    target = _detach_dist(step_dists[-1])
+    loss_noisy_actions = torch.cat([
+        kl_divergence(_slice_dist(target, mask_i), _slice_dist(noisy_i, mask_i))
+        for noisy_i, mask_i in zip(
+            step_dists[:-1], [torch.where(m) for m in valid_mask_blocks[:-1]]
         )
+    ], dim=0).mean()
 
     loss_actor = loss_actions + loss_noisy_actions
 
@@ -360,10 +417,10 @@ class Controller(L.LightningModule, Configurable):
                 action_dist, _, _ = self.actor_critic.reset(context_actions[None], context_obs[None])
             else:
                 action_dist = self.actor_critic.clean_actor(action, td_obs_latent, advance_state=True)
-            action = action_dist.sample()
+            action = self._clip_action(action_dist.sample())
 
             # Step the environment:
-            action_raw = action.item() if action.numel() == 1 else action.cpu().numpy()
+            action_raw = self._action_for_env(action)
             obs, reward, terminated, truncated, info = env.step(action_raw)
 
             # Update the replay buffer (stored as YCbCr, not RGB):
@@ -404,6 +461,32 @@ class Controller(L.LightningModule, Configurable):
             log_dict_fn = self.log_dict
         if stats_collector is not None:
             stats_collector.log_epoch_stats(log_dict_fn)
+
+    def _clip_action(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Clip a sampled action into the action space (a no-op for discrete spaces).
+
+        This is the one place the `Box` bounds are enforced: the Gaussian policy is
+        deliberately unbounded, which keeps its log-prob and entropy exact, so the
+        sample is clipped where it leaves the policy -- once, so that the environment,
+        the replay buffer and the context buffer all see the same action.
+        """
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            return action
+
+        assert isinstance(self.action_space, gym.spaces.Box), f"Got {self.action_space}"
+        bounds = [
+            torch.as_tensor(b, device=action.device, dtype=action.dtype)
+            for b in (self.action_space.low, self.action_space.high)
+        ]
+        return action.clamp(*bounds)
+
+    def _action_for_env(self, action: torch.Tensor):
+        """Convert an action of shape (1, 1) / (1, 1, A) to what `env.step` expects."""
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            return action.item()
+
+        return action[0, 0].cpu().numpy().astype(self.action_space.dtype)
 
     @torch.no_grad()
     def collect_test_episodes(self, num_episodes: int, env: gym.Env, collect_stats_only: bool = True):
@@ -508,7 +591,7 @@ class Controller(L.LightningModule, Configurable):
 
         values = values[torch.where(valid_mask[-1])]
         valid_lambda_returns = lambda_returns[torch.where(valid_mask[-1])]
-        avg_num_action_changes, avg_action_change_time = self._collect_action_changes_stats(
+        action_changes_stats = self._collect_action_changes_stats(
             actions=traj_segment['action'],
             denoising_times=traj_segment['denoising_times']
         )
@@ -535,9 +618,8 @@ class Controller(L.LightningModule, Configurable):
             f"{name}/imagined_rewards_min": traj_segment['extrinsic_reward'].detach().min(),
             f"{name}/total_rewards_avg": traj_segment['reward'].detach().mean(),
             f"{name}/num_ends": traj_segment['terminated'].detach().float().sum(dim=1).mean(),
-            f"{name}/avg_num_action_changes": avg_num_action_changes,
-            f"{name}/avg_action_change_time": avg_action_change_time,
         }
+        info.update({f"{name}/{k}": v for k, v in action_changes_stats.items()})
         if self.use_intrinsic_reward:
             info.update({
                 f"{name}/intrinsic_reward_avg": traj_segment['intrinsic_reward'].detach().mean(),
@@ -606,19 +688,40 @@ class Controller(L.LightningModule, Configurable):
         else:
             traj_segment['reward'] = extrinsic_reward + scaled_intrinsic_reward
 
-    def _collect_action_changes_stats(self, actions, denoising_times):
-        actions = torch.stack(actions, dim=0)
-        denoising_times = torch.stack(denoising_times, dim=0)
-        action_changes = (actions[1:] != actions[:-1])
-        avg_num_action_changes = action_changes.sum(dim=0).float()
-        avg_action_change_time = action_changes.float() * denoising_times[1:]
-        avg_action_change_time = avg_action_change_time.sum(dim=0)
-        avg_action_change_time = (
-            avg_action_change_time[torch.where(avg_num_action_changes > 0)] / 
-            avg_num_action_changes[torch.where(avg_num_action_changes > 0)]
-        )
+    def _collect_action_changes_stats(self, actions, denoising_times) -> dict:
+        """
+        How much, and how late, the sampled action moves over the denoising process --
+        the stability of the action producer.
 
-        return avg_num_action_changes.mean(), avg_action_change_time.mean()
+        `actions` holds one entry per denoising step plus the final clean one, and the
+        per-step move `actions[i+1] - actions[i]` is attributed to the time of the later
+        action. For a discrete action the move is a change of index and its size is a
+        count; for a continuous one it is the L2 distance travelled.
+
+        Note this relies on `make_valid_mask` having already appended the clean step's
+        time (all ones) to `denoising_times` in place -- which is why it must run first.
+        """
+        actions = torch.stack(actions, dim=0)
+        change_times = torch.stack(denoising_times, dim=0)[1:]
+        assert change_times.shape[0] == actions.shape[0] - 1, \
+            f"Got {change_times.shape[0]} denoising times for {actions.shape[0]} actions."
+
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            size_key = 'avg_num_action_changes'
+            change_size = (actions[1:] != actions[:-1]).float()
+        else:
+            size_key = 'avg_action_drift'
+            change_size = torch.linalg.vector_norm(actions[1:] - actions[:-1], dim=-1)
+
+        total_change = change_size.sum(dim=0)
+        moved = torch.where(total_change > 0)
+        # Change-weighted mean denoising time, over the entries that moved at all:
+        avg_change_time = (change_size * change_times).sum(dim=0)[moved] / total_change[moved]
+
+        return {
+            size_key: total_change.mean(),
+            'avg_action_change_time': avg_change_time.mean(),
+        }
     
     def configure_optimizers(self):
         return torch.optim.AdamW(

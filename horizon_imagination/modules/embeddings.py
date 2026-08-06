@@ -1,8 +1,44 @@
 import math
 
+import gymnasium as gym
+import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+
+def action_dim(action_space: gym.Space) -> int:
+    """The width of the action vector a `Box` action space produces."""
+    assert isinstance(action_space, gym.spaces.Box), f"Got {action_space}"
+    return int(np.prod(action_space.shape))
+
+
+def build_action_embedder(
+        action_space: gym.Space,
+        embed_dim: int,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
+) -> nn.Module:
+    """
+    Build the module that maps a batch of actions to `embed_dim`-wide vectors.
+
+    Discrete actions, shape (B, T), are looked up in an embedding table; continuous
+    (`Box`) actions, shape (B, T, A), are projected linearly. Either way the output
+    is (B, T, embed_dim), which is what every call site expects.
+    """
+    if isinstance(action_space, gym.spaces.Discrete):
+        embedder = nn.Embedding(action_space.n, embed_dim, device=device, dtype=dtype)
+
+        std = 1.0 / math.sqrt(embed_dim)
+        torch.nn.init.trunc_normal_(embedder.weight, std=std, a=-3 * std, b=3 * std)
+
+        return embedder
+
+    if isinstance(action_space, gym.spaces.Box):
+        return nn.Linear(action_dim(action_space), embed_dim, device=device, dtype=dtype)
+
+    # TODO: support more action modalities
+    raise NotImplementedError(f"Currently action space {action_space} is not supported.")
 
 
 class NoiseLevelEmbedding(nn.Module):

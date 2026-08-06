@@ -6,7 +6,7 @@ import gymnasium as gym
 
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.modules.transform import PerModalityTransform
-from horizon_imagination.modules.embeddings import NoiseLevelEmbedding
+from horizon_imagination.modules.embeddings import NoiseLevelEmbedding, build_action_embedder
 
 
 class LightweightSeqModel(nn.Module, Configurable):
@@ -54,10 +54,9 @@ class LightweightSeqModel(nn.Module, Configurable):
         )
 
     def _build_action_emb(self):
-        assert isinstance(self.config.action_space, gym.spaces.Discrete)
-        return nn.Embedding(
-            num_embeddings=self.config.action_space.n,
-            embedding_dim=self.config.latent_dim,
+        return build_action_embedder(
+            self.config.action_space,
+            self.config.latent_dim,
             device=self.config.device,
             dtype=self.config.dtype,
         )
@@ -77,7 +76,8 @@ class LightweightSeqModel(nn.Module, Configurable):
             assert noise_level is None, \
                 "noise-level conditioning is only supported with ignore_actions=True"
             # If actions[i, j] = a_t  ==> obs[i, j] = o_{t+1} is the observation resulted from a_t
-            assert actions.dim() == 2, f"Got {actions.shape}"
+            # (b t) for discrete actions, (b t a) for continuous ones:
+            assert actions.dim() in (2, 3), f"Got {actions.shape}"
             actions = self.action_emb(actions)  # (b t d)
 
             x = torch.stack([actions, *list(x.values())], dim=2).flatten(1, 2)

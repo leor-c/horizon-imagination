@@ -90,7 +90,7 @@ def get_agent_online_config(
 
     # Init config instance:
     observation_space: gym.spaces.Dict = env.observation_space
-    action_space: gym.spaces.Discrete = env.action_space
+    action_space: gym.Space = env.action_space
 
     tokenizer_cfg = get_cosmos_tokenizer_online_config(dtype=dtype, resolution=resolution)
     tokenizer_channels = tokenizer_cfg.latent_channels

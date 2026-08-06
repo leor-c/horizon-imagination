@@ -49,7 +49,13 @@ class DenoiserWithPolicyWrapper(DenoiserBase):
         ctx_t = None
         ctx_len = 0
         if context_actions is not None:
-            ctx_t = torch.ones_like(context_actions)
+            # Diffusion time is per frame, (B, T) -- not per action component, which is
+            # what `context_actions` carries a third axis of when actions are continuous.
+            ctx_t = torch.ones(
+                context_actions.shape[:2],
+                device=context_actions.device,
+                dtype=torch.float32,
+            )
             ctx_len = context_actions.shape[1]
         self.context_t = ctx_t
         self.context_len = ctx_len

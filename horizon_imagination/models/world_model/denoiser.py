@@ -1,7 +1,6 @@
 from typing import Union
 from collections import OrderedDict
 from dataclasses import dataclass
-import math
 
 import torch
 import torch.nn as nn
@@ -19,6 +18,7 @@ from horizon_imagination.utilities.types import ObsKey, Modality, canonical_obs_
 from horizon_imagination.modules.transform import (
     BaseTransform, PerModalityTransform, ImagePatcherTransform, VectorTokenTransform
 )
+from horizon_imagination.modules.embeddings import build_action_embedder
 
 from horizon_imagination.models.world_model.dit import DiT, KVCache
 
@@ -159,21 +159,11 @@ class VideoDiTDenoiser(DenoiserBase, Configurable):
         )
 
     def _build_action_embedder(self):
-        action_space = self.config.action_space
-        if isinstance(action_space, gym.spaces.Discrete):
-            action_embedder = nn.Embedding(
-                action_space.n,
-                self.embed_dim,
-                device=self.config.dit_cfg.device,
-            )
-
-            std = 1.0 / math.sqrt(self.embed_dim)
-            torch.nn.init.trunc_normal_(action_embedder.weight, std=std, a=-3 * std, b=3 * std)
-
-            return action_embedder
-        else:
-            # TODO: support more action modalities
-            raise NotImplementedError(f"Currently action space {action_space} is not supported.")
+        return build_action_embedder(
+            self.config.action_space,
+            self.embed_dim,
+            device=self.config.dit_cfg.device,
+        )
 
     @property
     def embed_dim(self):

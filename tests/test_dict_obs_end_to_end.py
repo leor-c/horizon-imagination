@@ -28,7 +28,7 @@ RAW_SIZE = 72  # exercises ResizeObsWrapper too
 class _SyntheticEnv(gym.Env):
     """An env whose observation is a Box, or a Dict of images and vectors."""
 
-    def __init__(self, dict_obs: bool):
+    def __init__(self, dict_obs: bool, action_space: gym.Space = None):
         self.dict_obs = dict_obs
         image_space = gym.spaces.Box(0, 255, (RAW_SIZE, RAW_SIZE, 3), np.uint8)
         self.observation_space = gym.spaces.Dict({
@@ -36,7 +36,7 @@ class _SyntheticEnv(gym.Env):
             'aux': image_space,
             'proprio': gym.spaces.Box(-1.0, 1.0, (7,), np.float32),
         }) if dict_obs else image_space
-        self.action_space = gym.spaces.Discrete(4)
+        self.action_space = action_space or gym.spaces.Discrete(4)
         self.rng = np.random.default_rng(0)
         self.t = 0
 
@@ -57,27 +57,33 @@ class _SyntheticEnv(gym.Env):
         return self._obs(), {}
 
     def step(self, action):
+        assert self.action_space.contains(action), \
+            f"{action} is outside {self.action_space} -- continuous actions must be clipped."
         self.t += 1
         return self._obs(), 1.0, self.t >= 12, False, {}
 
 
-def _make_env(dict_obs: bool):
-    env = _SyntheticEnv(dict_obs)
+def _make_env(dict_obs: bool, action_space: gym.Space = None):
+    env = _SyntheticEnv(dict_obs, action_space)
     env = ResizeObsWrapper(env, size=(RESOLUTION, RESOLUTION))
     env = ImageChannelsFirst(env)
     return ModalityDictObsWrapper(env)
 
 
-@pytest.mark.parametrize("dict_obs,expected_keys", [
-    (False, {'image|features'}),
-    (True, {'image|rgb', 'image|aux', 'vector|proprio'}),
-])
-def test_agent_trains_every_component(dict_obs, expected_keys, tmp_path):
+@pytest.mark.parametrize("dict_obs,expected_keys,action_space", [
+    (False, {'image|features'}, None),
+    (True, {'image|rgb', 'image|aux', 'vector|proprio'}, None),
+    # Continuous actions: a Gaussian policy, a linear action embedder in the denoiser
+    # and the stable continuous producer driving imagination.
+    (True, {'image|rgb', 'image|aux', 'vector|proprio'},
+     gym.spaces.Box(-1.0, 1.0, (3,), np.float32)),
+], ids=['single_image', 'dict_obs', 'dict_obs_box_actions'])
+def test_agent_trains_every_component(dict_obs, expected_keys, action_space, tmp_path):
     from config.agent import get_agent_online_config
     from horizon_imagination.agent import Agent
     from horizon_imagination.data import EpochDataIterator
 
-    env = _make_env(dict_obs)
+    env = _make_env(dict_obs, action_space)
     assert set(env.observation_space.spaces) == expected_keys
 
     cfg = get_agent_online_config(
