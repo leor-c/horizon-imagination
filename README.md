@@ -106,6 +106,7 @@ portal-env start <env_name> -b mm
 Supported environments:
 - `ale` — Atari (ALE)
 - `craftium` — Craftium (Minecraft-like)
+- `mujoco` — Gymnasium MuJoCo (continuous control, state observations)
 
 Example:
 ```bash
@@ -128,6 +129,16 @@ python experiments/train_agent_online.py \
   -b ale \
   -g ALE/Boxing-v5
 ```
+
+For MuJoCo, build the server env once (`portal-env build -b mm -e mujoco`), then:
+```bash
+portal-env start mujoco -b mm
+python experiments/train_agent_online.py \
+  -b mujoco \
+  -g HalfCheetah-v5
+```
+MuJoCo observations are state vectors, so no image tokenizer is built and no
+imagination videos are logged — the vector autoencoder is the only stage-1 encoder.
 
 ----
 

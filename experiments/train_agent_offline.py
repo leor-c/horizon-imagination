@@ -27,6 +27,8 @@ def load_pretrained_agent(agent_cfg, weights_path, load_type):
         if any(k.startswith('image.') for k in tok_weights):
             agent.tokenizer.load_state_dict(tok_weights)
         else:
+            assert agent.tokenizer.image is not None, \
+                "The checkpoint holds image tokenizer weights, but this observation has no image key."
             agent.tokenizer.image.load_state_dict(tok_weights)
 
         if load_type == 'wm':
@@ -36,7 +38,7 @@ def load_pretrained_agent(agent_cfg, weights_path, load_type):
 
 
 def train_agent(
-        benchmark: Literal['retro', 'craftium', 'ale'], 
+        benchmark: Literal['retro', 'craftium', 'ale', 'mujoco'],
         offline: bool,
         data_path: Path,
         weights_path: Path, 
@@ -92,7 +94,7 @@ def eval_agent():
 @click.option(
     '-b', 
     '--benchmark', 
-    type=click.Choice(['craftium', 'ale']), 
+    type=click.Choice(['craftium', 'ale', 'mujoco']),
     default='ale'
 )
 @click.option(

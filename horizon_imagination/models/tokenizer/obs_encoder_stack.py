@@ -20,13 +20,16 @@ from horizon_imagination.models.tokenizer.vector import VectorAutoencoder
 class ObsEncoderStack(L.LightningModule, Configurable):
     @dataclass
     class Config(BaseConfig):
-        image_tokenizer: CosmosImageTokenizer
-        # None when the observation has no vector keys:
+        # Each is None when the observation has no key of that modality. At least one
+        # of them is always present.
+        image_tokenizer: CosmosImageTokenizer = None
         vector_autoencoder: VectorAutoencoder = None
 
     def __init__(self, config: Config, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
+        assert config.image_tokenizer is not None or config.vector_autoencoder is not None, \
+            "ObsEncoderStack needs at least one stage-1 encoder."
         self.image = config.image_tokenizer
         self.vector = config.vector_autoencoder
 
@@ -49,6 +52,7 @@ class ObsEncoderStack(L.LightningModule, Configurable):
 
         img_keys = image_keys(batch.keys())
         if img_keys:
+            assert self.image is not None, f"No image tokenizer for keys {img_keys}"
             # One shared image tokenizer across all image keys: the keys are
             # concatenated on the batch dim, so each contributes equally.
             images = torch.cat([batch[k] for k in img_keys], dim=0)
@@ -64,6 +68,9 @@ class ObsEncoderStack(L.LightningModule, Configurable):
         return loss
 
     def configure_optimizers(self):
+        if self.image is None:
+            return self.vector.configure_optimizers()
+
         optimizer = self.image.configure_optimizers()
         if self.vector is not None:
             vector_optimizer = self.vector.configure_optimizers()

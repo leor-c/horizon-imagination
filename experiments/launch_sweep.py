@@ -9,8 +9,8 @@ from loguru import logger
 
 
 @click.command()
-@click.argument('benchmark', type=click.Choice(['ale', 'craftium']))
-def create_sweep(benchmark: Literal['ale', 'craftium']):
+@click.argument('benchmark', type=click.Choice(['ale', 'craftium', 'mujoco']))
+def create_sweep(benchmark: Literal['ale', 'craftium', 'mujoco']):
     """
     Creates a new WandB sweep with the specified configuration.
     The command specifies how to run the training script.
@@ -33,6 +33,15 @@ def create_sweep(benchmark: Literal['ale', 'craftium']):
                 'Craftium/ChopTree-v0',
                 'Craftium/SmallRoom-v0',
                 'Craftium/Room-v0',
+            ]
+        }
+    elif benchmark == 'mujoco':
+        grid_kwargs['game'] = {
+            'values': [
+                'HalfCheetah-v5',
+                'Hopper-v5',
+                'Walker2d-v5',
+                'Ant-v5',
             ]
         }
     else:
@@ -68,7 +77,7 @@ def create_sweep(benchmark: Literal['ale', 'craftium']):
 @click.command()
 @click.argument('sweep_id', type=str)
 @click.option('-n', '--num-gpus', type=int, default=8)
-@click.option('-b', '--benchmark', type=click.Choice(['ale', 'craftium']), default='ale')
+@click.option('-b', '--benchmark', type=click.Choice(['ale', 'craftium', 'mujoco']), default='ale')
 def run_agents(sweep_id, num_gpus, benchmark):
     logger.info(f"Starting {num_gpus} WandB agents for sweep ID: {sweep_id}")
 

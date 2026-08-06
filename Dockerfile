@@ -27,6 +27,7 @@ RUN micromamba activate base
 RUN pip install -U portal-env
 RUN portal-env build -b mm -e ale
 RUN portal-env build -b mm -e craftium
+RUN portal-env build -b mm -e mujoco
 
 #USER $MAMBA_USER
 

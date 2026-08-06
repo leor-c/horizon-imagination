@@ -61,7 +61,8 @@ def get_world_model_online_config(
     # pre-patch units.
     position_rows = len(img_keys) * (latent_h // patch_spatial) + len(vec_keys)
     position_cols = max(
-        [latent_w // patch_spatial] + [vector_autoencoder.num_tokens(k) for k in vec_keys]
+        ([latent_w // patch_spatial] if img_keys else [])
+        + [vector_autoencoder.num_tokens(k) for k in vec_keys]
     )
 
     # Denoiser Network:
@@ -93,7 +94,7 @@ def get_world_model_online_config(
             Modality.image: ImageToLatentTransform(
                 image_tokenizer=image_tokenizer.to(device=device, dtype=dtype)
             )
-        },
+        } if img_keys else {},
         fixed_per_key_transforms={
             k: VectorToLatentTransform(vector_autoencoder, k) for k in vec_keys
         },
@@ -116,7 +117,7 @@ def get_world_model_online_config(
                         device=device,
                         dtype=dtype
                     ).make_instance()
-                },
+                } if img_keys else {},
                 learned_per_key_transforms={
                     k: VectorLatentToVecTransform.Config(
                         latent_dim=vector_dim,

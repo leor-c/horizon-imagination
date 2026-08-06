@@ -318,6 +318,9 @@ class Agent(Configurable, L.LightningModule):
         obs = ycbcr_to_rgb_obs(obs, drop_ycbcr=True)
         # Every image key gets its own row of the video frame:
         img_keys = image_keys(obs.keys())
+        if not img_keys:
+            # Vector-only observations (e.g. MuJoCo state): nothing to render.
+            return
         np_ctx = _stack_image_keys([
             rearrange(obs[:, :context_length][k].clone(), 'b t c h w -> b t h w c').cpu().numpy()
             for k in img_keys
@@ -332,25 +335,32 @@ class Agent(Configurable, L.LightningModule):
              self.config.training.world_model_num_epochs)
         ):
             device = self.config.world_model.config.denoiser_config.device
-            action_producers = [
-                lambda a: FixedActionProducer(actions=a),
-                lambda a: NaivePseudoPolicyActionProducer(
-                    actions=a,
-                    num_actions=self.config.action_space.n,
-                    device=device,
-                ),
-                lambda a: StablePseudoPolicyActionProducer(
-                    actions=a,
-                    num_actions=self.config.action_space.n,
-                    device=device
-                )
-            ]
+            action_producers = [lambda a: FixedActionProducer(actions=a)]
+            producer_labels = ['Fixed']
+            if isinstance(self.config.action_space, gym.spaces.Discrete):
+                # The pseudo-policy producers perturb a one-hot action distribution and
+                # so have no continuous analogue; a Box action space gets the fixed-action
+                # comparison only.
+                action_producers += [
+                    lambda a: NaivePseudoPolicyActionProducer(
+                        actions=a,
+                        num_actions=self.config.action_space.n,
+                        device=device,
+                    ),
+                    lambda a: StablePseudoPolicyActionProducer(
+                        actions=a,
+                        num_actions=self.config.action_space.n,
+                        device=device
+                    )
+                ]
+                producer_labels += ['Naive', 'Ours']
         else:
             action_producers = [
                 lambda a: FixedActionProducer(actions=a),
                 lambda a: NaivePolicyActionProducer(self.controller.actor_critic),
                 lambda a: StablePolicyActionProducer(self.controller.actor_critic),
             ]
+            producer_labels = ['Fixed', 'Naive', 'Ours']
 
         actions = batch['action'][:, context_length:]
         
@@ -401,7 +411,7 @@ class Agent(Configurable, L.LightningModule):
         ])
         rec = np.concatenate([np_ctx, rec], axis=1)
 
-        labels = ['Ground Truth', 'Reconstructions', 'Fixed', 'Naive', 'Ours']
+        labels = ['Ground Truth', 'Reconstructions', *producer_labels]
         sequences = [ground_truth, rec, *predictions]
         video_path = 'eval_last.mp4'
         frames = generate_video(sequences, labels, output_path=video_path, fps=5, scale=4)

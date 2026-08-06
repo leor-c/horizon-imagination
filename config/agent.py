@@ -92,18 +92,26 @@ def get_agent_online_config(
     observation_space: gym.spaces.Dict = env.observation_space
     action_space: gym.Space = env.action_space
 
+    img_keys = image_keys(observation_space.spaces.keys())
+    vec_keys = vector_keys(observation_space.spaces.keys())
+
+    # The tokenizer *config* is always built: it supplies the latent channel count and
+    # spatial shape the DiT and the reward/controller backbones are sized from. Only the
+    # tokenizer itself is skipped when the observation carries no image key (e.g. MuJoCo
+    # state observations).
     tokenizer_cfg = get_cosmos_tokenizer_online_config(dtype=dtype, resolution=resolution)
     tokenizer_channels = tokenizer_cfg.latent_channels
     latent_size = resolution // tokenizer_cfg.network_cfg.spatial_compression
     latent_spatial_shape = (latent_size, latent_size)
 
-    tokenizer: CosmosImageTokenizer = init_component(
-        tokenizer_cfg,
-        load_pretrained_tokenizer,
-        tokenizer_weights_path
-    )
+    tokenizer: CosmosImageTokenizer = None
+    if img_keys:
+        tokenizer = init_component(
+            tokenizer_cfg,
+            load_pretrained_tokenizer,
+            tokenizer_weights_path
+        )
 
-    vec_keys = vector_keys(observation_space.spaces.keys())
     vector_autoencoder: VectorAutoencoder = None
     if vec_keys:
         vector_autoencoder = VectorAutoencoder.Config(
@@ -166,7 +174,7 @@ def get_agent_online_config(
     # Images are stored as YCbCr components (4:2:0), not RGB -- one pair of fields
     # per image key:
     schema = schema_from_gym_spaces(env.observation_space, env.action_space)
-    for key in image_keys(observation_space.spaces.keys()):
+    for key in img_keys:
         img_field = schema.fields.pop(str(key))
         h, w = img_field.shape[-2:]
         for component_key, shape in [

@@ -1,5 +1,7 @@
 from typing import Literal
-from horizon_imagination.envs.wrappers import ModalityDictObsWrapper, ImageChannelsFirst, FrameSkip
+from horizon_imagination.envs.wrappers import (
+    ModalityDictObsWrapper, ImageChannelsFirst, Float32ObsWrapper
+)
 import gymnasium as gym
 
 
@@ -68,8 +70,31 @@ def make_ale_env(
 
     return env
 
+
+def make_mujoco_env(
+        env_name: str = "HalfCheetah-v5",
+        agent_in_docker: bool = True,
+    ):
+    """
+    Gymnasium MuJoCo, served by portal-env's stock `mujoco` server (a bare
+    `gymnasium.make`). The observation is the environment's state vector -- there is
+    no image -- so none of the image preprocessing wrappers apply.
+    """
+    import portal_env
+
+    env = portal_env.AgentSidePortal(
+        "mujoco",
+        env_args=[env_name],
+        agent_in_docker=agent_in_docker,
+    )
+    env = Float32ObsWrapper(env)
+    env = ModalityDictObsWrapper(env)
+
+    return env
+
+
 def make_env(
-        benchmark: Literal['craftium', 'ale'],
+        benchmark: Literal['craftium', 'ale', 'mujoco'],
         portal_env_backend: Literal['docker', 'micromamba', 'mm'],
         env_name: str = None,
         resolution: int = 64,
@@ -98,6 +123,13 @@ def make_env(
         env_kwargs['env_name'] = env_name
 
         return make_ale_env(**env_kwargs), env_name
-    
+
+    elif benchmark == 'mujoco':
+        if env_name is None:
+            env_name = 'HalfCheetah-v5'
+
+        # State observations: `resolution` does not apply.
+        return make_mujoco_env(env_name=env_name, agent_in_docker=agent_in_docker), env_name
+
     else:
         raise ValueError(f"Benchmark '{benchmark}' is not supported.")

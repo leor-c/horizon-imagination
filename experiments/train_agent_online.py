@@ -23,7 +23,7 @@ class GracefulShutdown(Callback):
 
 
 def train_agent(
-        benchmark: Literal['craftium', 'ale'], 
+        benchmark: Literal['craftium', 'ale', 'mujoco'],
         offline,
         portal_env_backend: Literal['docker', 'micromamba', 'mm'],
         game: Optional[str],
@@ -115,7 +115,7 @@ def train_agent(
 @click.option(
     '-b', 
     '--benchmark', 
-    type=click.Choice(['craftium', 'ale']), 
+    type=click.Choice(['craftium', 'ale', 'mujoco']),
     default='ale'
 )
 @click.option('--offline', is_flag=True)

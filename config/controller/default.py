@@ -1,7 +1,7 @@
 from typing import Literal
 import gymnasium as gym
 
-from horizon_imagination.utilities.types import Modality, vector_keys
+from horizon_imagination.utilities.types import Modality, image_keys, vector_keys
 from horizon_imagination.modules.transform import (
     PerModalityTransform, ImageLatentToVecTransform, VectorLatentToVecTransform
 )
@@ -19,6 +19,7 @@ def _get_actor_critic_cfg(
         tokenizer_channels: int,
         latent_spatial_shape: tuple[int, int],
         vector_autoencoder,
+        image_obs_keys: list,
         vector_obs_keys: list,
         device,
         dtype
@@ -49,7 +50,7 @@ def _get_actor_critic_cfg(
                         device=device,
                         dtype=dtype
                     ).make_instance()
-                },
+                } if image_obs_keys else {},
                 learned_per_key_transforms={
                     k: VectorLatentToVecTransform.Config(
                         latent_dim=vector_autoencoder.config.latent_dim,
@@ -135,6 +136,7 @@ def get_controller_config(
         tokenizer_channels=tokenizer_channels,
         latent_spatial_shape=latent_spatial_shape,
         vector_autoencoder=vector_autoencoder,
+        image_obs_keys=image_keys(obs_space.spaces.keys()),
         vector_obs_keys=vector_keys(obs_space.spaces.keys()),
         device=device,
         dtype=dtype

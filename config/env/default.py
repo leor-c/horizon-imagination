@@ -9,7 +9,7 @@ class EnvConfig:
 
 
 def get_default_env_config(
-        benchmark: Literal['craftium', 'ale'],
+        benchmark: Literal['craftium', 'ale', 'mujoco'],
         game: Optional[str] = None,
 ) -> EnvConfig:
     resolution = 64
@@ -21,5 +21,9 @@ def get_default_env_config(
         return EnvConfig('Craftium/ChopTree-v0', resolution=resolution)
     elif benchmark == 'ale':
         return EnvConfig('ALE/Boxing-v5', resolution=resolution)
+    elif benchmark == 'mujoco':
+        # State observations: `resolution` is unused by the env, but still sizes the
+        # image-latent constants the DiT config is derived from.
+        return EnvConfig('HalfCheetah-v5', resolution=resolution)
     else:
         raise ValueError(f"Unknown benchmark: {benchmark}")

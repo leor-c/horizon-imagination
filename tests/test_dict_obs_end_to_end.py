@@ -16,7 +16,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("tensordict")
 
 from horizon_imagination.envs.wrappers import (
-    ImageChannelsFirst, ResizeObsWrapper, ModalityDictObsWrapper,
+    ImageChannelsFirst, ResizeObsWrapper, ModalityDictObsWrapper, Float32ObsWrapper,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -25,17 +25,26 @@ RESOLUTION = 64
 RAW_SIZE = 72  # exercises ResizeObsWrapper too
 
 
-class _SyntheticEnv(gym.Env):
-    """An env whose observation is a Box, or a Dict of images and vectors."""
+VECTOR_DIM = 11
 
-    def __init__(self, dict_obs: bool, action_space: gym.Space = None):
-        self.dict_obs = dict_obs
+
+class _SyntheticEnv(gym.Env):
+    """An env whose observation is a Box image, a state vector, or a Dict of both."""
+
+    def __init__(self, obs_kind: str, action_space: gym.Space = None):
+        self.obs_kind = obs_kind
         image_space = gym.spaces.Box(0, 255, (RAW_SIZE, RAW_SIZE, 3), np.uint8)
-        self.observation_space = gym.spaces.Dict({
-            'rgb': image_space,
-            'aux': image_space,
-            'proprio': gym.spaces.Box(-1.0, 1.0, (7,), np.float32),
-        }) if dict_obs else image_space
+        # Unbounded float64, as gymnasium's MuJoCo envs report their state:
+        vector_space = gym.spaces.Box(-np.inf, np.inf, (VECTOR_DIM,), np.float64)
+        self.observation_space = {
+            'image': image_space,
+            'vector': vector_space,
+            'dict': gym.spaces.Dict({
+                'rgb': image_space,
+                'aux': image_space,
+                'proprio': gym.spaces.Box(-1.0, 1.0, (7,), np.float32),
+            }),
+        }[obs_kind]
         self.action_space = action_space or gym.spaces.Discrete(4)
         self.rng = np.random.default_rng(0)
         self.t = 0
@@ -44,8 +53,10 @@ class _SyntheticEnv(gym.Env):
         return self.rng.integers(0, 255, (RAW_SIZE, RAW_SIZE, 3), dtype=np.uint8)
 
     def _obs(self):
-        if not self.dict_obs:
+        if self.obs_kind == 'image':
             return self._image()
+        if self.obs_kind == 'vector':
+            return self.rng.normal(0, 3, (VECTOR_DIM,))  # float64
         return {
             'rgb': self._image(),
             'aux': self._image(),
@@ -63,28 +74,38 @@ class _SyntheticEnv(gym.Env):
         return self._obs(), 1.0, self.t >= 12, False, {}
 
 
-def _make_env(dict_obs: bool, action_space: gym.Space = None):
-    env = _SyntheticEnv(dict_obs, action_space)
+def _make_env(obs_kind: str, action_space: gym.Space = None):
+    env = _SyntheticEnv(obs_kind, action_space)
+    if obs_kind == 'vector':
+        # No image entries, so the image preprocessing wrappers do not apply.
+        return ModalityDictObsWrapper(Float32ObsWrapper(env))
     env = ResizeObsWrapper(env, size=(RESOLUTION, RESOLUTION))
     env = ImageChannelsFirst(env)
     return ModalityDictObsWrapper(env)
 
 
-@pytest.mark.parametrize("dict_obs,expected_keys,action_space", [
-    (False, {'image|features'}, None),
-    (True, {'image|rgb', 'image|aux', 'vector|proprio'}, None),
+@pytest.mark.parametrize("obs_kind,expected_keys,action_space", [
+    ('image', {'image|features'}, None),
+    ('dict', {'image|rgb', 'image|aux', 'vector|proprio'}, None),
     # Continuous actions: a Gaussian policy, a linear action embedder in the denoiser
     # and the stable continuous producer driving imagination.
-    (True, {'image|rgb', 'image|aux', 'vector|proprio'},
+    ('dict', {'image|rgb', 'image|aux', 'vector|proprio'},
      gym.spaces.Box(-1.0, 1.0, (3,), np.float32)),
-], ids=['single_image', 'dict_obs', 'dict_obs_box_actions'])
-def test_agent_trains_every_component(dict_obs, expected_keys, action_space, tmp_path):
+    # A MuJoCo-shaped observation: an unbounded state vector and no image at all, so
+    # the vector autoencoder is the only stage-1 encoder and no image tokenizer is built.
+    ('vector', {'vector|features'}, gym.spaces.Box(-1.0, 1.0, (3,), np.float32)),
+], ids=['single_image', 'dict_obs', 'dict_obs_box_actions', 'vector_only_box_actions'])
+def test_agent_trains_every_component(obs_kind, expected_keys, action_space, tmp_path):
     from config.agent import get_agent_online_config
     from horizon_imagination.agent import Agent
     from horizon_imagination.data import EpochDataIterator
 
-    env = _make_env(dict_obs, action_space)
+    env = _make_env(obs_kind, action_space)
     assert set(env.observation_space.spaces) == expected_keys
+    if obs_kind == 'vector':
+        # Float32ObsWrapper downcasts both the space and the observations:
+        assert env.observation_space['vector|features'].dtype == np.float32
+        assert env.reset()[0]['vector|features'].dtype == np.float32
 
     cfg = get_agent_online_config(
         env=env, env_name='Synthetic/Test-v0',
@@ -94,6 +115,9 @@ def test_agent_trains_every_component(dict_obs, expected_keys, action_space, tmp
     cfg.controller.config.imagination_batch_size = 4
     cfg.controller.config.imagination_horizon = 4
     cfg.controller.config.num_denoising_steps = 2
+
+    # The image tokenizer is built only when the observation actually has an image key:
+    assert (cfg.obs_encoder.image is not None) == any('image|' in k for k in expected_keys)
 
     denoiser = cfg.world_model.denoiser
     assert set(map(str, denoiser.obs_spec)) == expected_keys

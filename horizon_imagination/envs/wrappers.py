@@ -57,6 +57,54 @@ class ModalityDictObsWrapper(gym.ObservationWrapper):
         return {self.obs_keys[0]: observation}
 
 
+class Float32ObsWrapper(gym.ObservationWrapper):
+    """
+    Downcast float64 observations (and their spaces) to float32.
+
+    MuJoCo reports its state observations as float64, which would be stored at twice
+    the size in the replay buffer for no benefit: the vector autoencoder normalizes
+    through ``.float()`` anyway. Runs *before* ``ModalityDictObsWrapper``, so it sees
+    either a single Box observation or a Dict of them; non-float64 entries (images,
+    already-float32 vectors) pass through untouched.
+    """
+
+    def __init__(self, env: Env[ObsType, ActType]):
+        super().__init__(env)
+
+        space = env.observation_space
+        self.is_dict_env = isinstance(space, gym.spaces.Dict)
+        if self.is_dict_env:
+            self.observation_space = gym.spaces.Dict(
+                {k: self._cast_space(v) for k, v in space.spaces.items()}
+            )
+        else:
+            self.observation_space = self._cast_space(space)
+
+    @staticmethod
+    def _needs_cast(space: gym.Space) -> bool:
+        return isinstance(space, gym.spaces.Box) and space.dtype == np.float64
+
+    @classmethod
+    def _cast_space(cls, space: gym.Space) -> gym.Space:
+        if not cls._needs_cast(space):
+            return space
+        return gym.spaces.Box(
+            low=space.low.astype(np.float32),
+            high=space.high.astype(np.float32),
+            shape=space.shape,
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _cast(value: np.ndarray) -> np.ndarray:
+        return value.astype(np.float32) if value.dtype == np.float64 else value
+
+    def observation(self, observation):
+        if self.is_dict_env:
+            return {k: self._cast(v) for k, v in observation.items()}
+        return self._cast(observation)
+
+
 def _is_image_space(space: gym.Space) -> bool:
     return isinstance(space, gym.spaces.Box) and np.issubdtype(space.dtype, np.uint8) \
         and len(space.shape) == 3
