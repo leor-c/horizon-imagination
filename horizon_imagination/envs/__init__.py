@@ -38,8 +38,8 @@ def make_craftium_env(
 
 def make_ale_env(
         env_name: str = "ALE/Boxing-v5",
-        terminate_on_life_loss: bool = False,
-        sign_rewards: bool = False,
+        terminate_on_life_loss: bool = True,
+        sign_rewards: bool = True,
         repeat_action_probability: float = 0.0,
         agent_in_docker: bool = True,
         resolution: int = 64,
@@ -52,6 +52,10 @@ def make_ale_env(
         env_kwargs={"repeat_action_probability": repeat_action_probability},
         agent_in_docker=agent_in_docker
     )
+    # Keep this inside the life-loss and reward-sign wrappers. It therefore records
+    # raw ALE rewards and emits ``info['episode']`` only on a real game over, while
+    # the agent still trains on signed rewards and treats each life as an episode.
+    env = gym.wrappers.RecordEpisodeStatistics(env)
     if repeat_action_probability == 0.0:
         env = NoopResetEnv(env)
     if terminate_on_life_loss:

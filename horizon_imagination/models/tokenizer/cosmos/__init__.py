@@ -36,6 +36,10 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
         # Run tokenizer forward computation in this dtype while retaining FP32
         # parameters and optimizer state. None disables local autocast.
         autocast_dtype: torch.dtype = None
+        # Compile the CUDA execution paths without replacing ``network`` with
+        # an OptimizedModule, preserving checkpoint keys and type checks.
+        torch_compile: bool = False
+        torch_compile_mode: str = "default"
         optimizer_cfg: OptimizerConfig
 
         @property
@@ -64,19 +68,32 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
         self.precision = config.precision
         self.autocast_dtype = config.autocast_dtype
 
+        # Keep the registered modules untouched and compile their bound
+        # callables instead. Besides preserving state-dict compatibility, this
+        # keeps isinstance(self.network, ...) valid in encode() and in users of
+        # the tokenizer internals (for example truncated latent round-trips).
+        self._network_forward = self.network.forward
+        self._network_encode = self.network.encode
+        self._network_decode = self.network.decode
+        self._compile_requested = config.torch_compile
+        self._compile_mode = config.torch_compile_mode
+        self._compiled = False
+
         self.metrics = [PSNRMetric()]
 
     def forward(self, x: Tensor):
+        self._compile_cuda_paths(x)
         with self._autocast(x):
             x = self._preprocess_images(x)
-            res = self.network.forward(x)
+            res = self._network_forward(x)
             # return res.latent, self._postprocess_images(res.reconstructions)
             return self._postprocess_images(res.reconstructions)
     
     def encode(self, x):
+        self._compile_cuda_paths(x)
         with self._autocast(x):
             x = self._preprocess_images(x)
-            z = self.network.encode(x)
+            z = self._network_encode(x)
             if isinstance(self.network, ContinuousImageTokenizer):
                 z = z[0]
             else:
@@ -84,17 +101,19 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
             return z
     
     def decode(self, z):
+        self._compile_cuda_paths(z)
         with self._autocast(z):
             if isinstance(self.network, DiscreteImageTokenizer):
                 z = self.network.quantizer(z)[1]
-            x_hat = self.network.decode(z)
+            x_hat = self._network_decode(z)
             return self._postprocess_images(x_hat)
 
     def training_step(self, batch, batch_idx, log_dict_fn = None):
         assert self.network.training
+        self._compile_cuda_paths(batch)
         with self._autocast(batch):
             batch = self._preprocess_images(batch)
-            output_dict = self.network.forward(batch)
+            output_dict = self._network_forward(batch)
             input_images, recon_images = batch, output_dict[RECON_KEY]
 
             # pass loss_mask to loss computation
@@ -112,6 +131,22 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
         log_dict_fn(losses, prog_bar=True, on_epoch=True, on_step=False)
 
         return sum([torch.mean(v) if (v.dim() > 0) else v for v in losses.values()])
+
+    def _compile_cuda_paths(self, x: Tensor):
+        """Lazily compile fixed-shape CUDA paths while leaving CPU execution eager."""
+        if self._compiled or not self._compile_requested or x.device.type != 'cuda':
+            return
+
+        compile_options = dict(dynamic=False, mode=self._compile_mode)
+        logging.info(
+            "Compiling tokenizer network and perceptual loss with torch.compile(mode=%s)",
+            self._compile_mode,
+        )
+        self._network_forward = torch.compile(self.network.forward, **compile_options)
+        self._network_encode = torch.compile(self.network.encode, **compile_options)
+        self._network_decode = torch.compile(self.network.decode, **compile_options)
+        self.perceptual_loss.torch_compile(mode=self._compile_mode)
+        self._compiled = True
 
     def _autocast(self, x: Tensor):
         """Tokenizer-local AMP; other Agent components remain in FP32."""

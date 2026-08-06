@@ -41,6 +41,10 @@ def get_cosmos_tokenizer_online_config(dtype, resolution: int = 64):
         optimizer_cfg=optimizer_cfg,
         precision=dtype,
         autocast_dtype=torch.bfloat16,
+        torch_compile=True,
+        # The upstream Cosmos code notes long-run CUDA-graph instability for
+        # the perceptual loss, so use Inductor fusion without CUDA graphs.
+        torch_compile_mode="default",
     )
 
     return cosmos_tokenizer_cfg

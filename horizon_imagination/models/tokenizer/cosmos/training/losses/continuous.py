@@ -156,6 +156,9 @@ class PerceptualLoss(LPIPS):
     def __init__(self, config):
         super(PerceptualLoss, self).__init__(config.checkpoint_activations)
         self.net = self.net.eval()
+        # Compile this callable instead of replacing ``net`` so checkpoint
+        # keys and the registered module hierarchy stay unchanged.
+        self._net_forward = self.net.forward
         self.gram_enabled = config.gram_enabled
         self.corr_enabled = config.corr_enabled
         self.layer_weights = list(config.layer_weights)
@@ -191,7 +194,7 @@ class PerceptualLoss(LPIPS):
             batch_size = input_images.shape[0]
 
         in0_input, in1_input = (self.scaling_layer(input_images), self.scaling_layer(reconstructions))
-        outs0, outs1 = self.net(in0_input), self.net(in1_input)
+        outs0, outs1 = self._net_forward(in0_input), self._net_forward(in1_input)
 
         _layer_weights = self.layer_weights
         weights_map, res, diffs = {}, {}, {}
@@ -232,12 +235,12 @@ class PerceptualLoss(LPIPS):
             output_dict["gram"] = self.gram_schedule(iteration) * gram_val
         return output_dict
 
-    def torch_compile(self):
+    def torch_compile(self, mode="default"):
         """
         This method invokes torch.compile() on this loss
         """
         # cuda-graphs crash after 1k iterations
-        self.net = torch.compile(self.net, dynamic=False)
+        self._net_forward = torch.compile(self.net.forward, dynamic=False, mode=mode)
 
 
 class FlowLoss(torch.nn.Module):

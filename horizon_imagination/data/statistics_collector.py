@@ -37,6 +37,7 @@ class ExperienceStatisticsCollector:
     def __init__(self):
         self.episode_return = StableSum()
         self._complete_episode_returns = []
+        self._complete_true_episode_returns = []
         self._complete_episode_nnz_rewards = []
         self._complete_episode_lengths = []
         self.epoch_return = StableSum()
@@ -50,6 +51,14 @@ class ExperienceStatisticsCollector:
     def step(self, obs, action, reward, terminated, truncated, info):
         self.num_epoch_steps += 1
         self.num_episode_steps += 1
+
+        # RecordEpisodeStatistics is placed inside the Atari reward/life wrappers,
+        # so this entry is present only for a real game over and contains raw reward.
+        if "episode" in info:
+            true_episode_return = np.asarray(info["episode"]["r"])
+            assert true_episode_return.size == 1, \
+                f"Expected one environment's episode return, got {true_episode_return}."
+            self._complete_true_episode_returns.append(float(true_episode_return.item()))
 
         self.epoch_return += reward
         self.episode_return += reward
@@ -100,11 +109,19 @@ class ExperienceStatisticsCollector:
             stats[f"{prefix}/avg_episode_nnz_reward"] = np.mean(self._complete_episode_nnz_rewards)
             stats[f"{prefix}/avg_episode_length"] = np.mean(self._complete_episode_lengths)
 
+        if self._complete_true_episode_returns:
+            stats[f"{prefix}/avg_true_episode_return"] = np.mean(
+                self._complete_true_episode_returns
+            )
+            stats[f"{prefix}/latest_true_episode_return"] = \
+                self._complete_true_episode_returns[-1]
+
         # Log:
         log_dict_fn(stats)
 
         # Reset:
         self._complete_episode_returns.clear()
+        self._complete_true_episode_returns.clear()
         self._complete_episode_nnz_rewards.clear()
         self._complete_episode_lengths.clear()
         self.epoch_return = StableSum()
