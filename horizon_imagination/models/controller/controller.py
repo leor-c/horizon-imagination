@@ -35,7 +35,7 @@ def compute_lambda_returns(rewards, values, ends, gamma, lambda_):
     lambda_returns[:, :-1] = rewards + ends.logical_not() * gamma * (1 - lambda_) * values[:, 1:]
 
     last = values[:, -1]
-    for i in reversed(range(t - 1)):
+    for i in reversed(range(t)):
         lambda_returns[:, i] += ends[:, i].logical_not() * gamma * lambda_ * last
         last = lambda_returns[:, i]
 
