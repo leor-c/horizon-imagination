@@ -102,12 +102,20 @@ class YCbCrColorLoss(torch.nn.Module):
         self.schedule = WeightScheduler(boundaries=config.boundaries, values=config.values)
 
     def forward(self, inputs, output_batch, iteration) -> dict[str, torch.Tensor]:
-        reconstructions = YCbCrTensor.from_rgb(output_batch[RECON_KEY])
-        targets = YCbCrTensor.from_rgb(inputs[INPUT_KEY])
-        y_loss = F.mse_loss(reconstructions.y, targets.y)
-        cb_loss = F.mse_loss(reconstructions.cb, targets.cb)
-        cr_loss = F.mse_loss(reconstructions.cr, targets.cr)
-        loss = y_loss + cb_loss + cr_loss
+        reconstruction_rgb = output_batch[RECON_KEY]
+        target_rgb = inputs[INPUT_KEY]
+        # This loss runs inside the tokenizer's local BF16 autocast region. Keep
+        # the color transform and MSE in FP32: chroma values are small relative
+        # to YCbCr's 128 offset and would otherwise lose precision. Crucially,
+        # do not use from_rgb's uint8 storage path -- rounding/casting to uint8
+        # severs autograd and turns the loss into a coarse diagnostic.
+        with torch.autocast(device_type=reconstruction_rgb.device.type, enabled=False):
+            reconstructions = YCbCrTensor.from_rgb(reconstruction_rgb.float(), as_uint8=False)
+            targets = YCbCrTensor.from_rgb(target_rgb.float(), as_uint8=False)
+            y_loss = F.mse_loss(reconstructions.y, targets.y)
+            cb_loss = F.mse_loss(reconstructions.cb, targets.cb)
+            cr_loss = F.mse_loss(reconstructions.cr, targets.cr)
+            loss = y_loss + cb_loss + cr_loss
         if torch.isnan(loss).any():
             raise ValueError("[COLOR] NaN detected in loss")
         return dict(color=loss)

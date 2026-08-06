@@ -9,7 +9,7 @@ from horizon_imagination.modules.transform import BaseTransform
 # allocator fragmented. Measured over a 960-frame round-trip at resolution 64: chunking both
 # directions takes peak memory from 15.2 GiB to 2.2 GiB and is marginally *faster*, so this
 # is not a memory-for-speed trade. Batches smaller than the chunk size are unaffected.
-DEFAULT_CHUNK_SIZE = 128
+DEFAULT_CHUNK_SIZE = 256
 
 
 def _is_cuda_oom_error(exc: RuntimeError) -> bool:

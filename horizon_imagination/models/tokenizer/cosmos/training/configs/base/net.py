@@ -52,7 +52,11 @@ class ContinuousImageTokenizerConfig(BaseConfig):
     out_channels: int = 3
     resolution: int = 1024
     patch_size: int = 2
-    patch_method: str = "haar"
+    patch_method: str = "rearrange"
+    # "unpatch" predicts one output-channel group per pixel phase and then
+    # interleaves them. "resize" upsamples shared features before predicting
+    # RGB, which avoids patch-phase checkerboards.
+    decoder_output_mode: str = "unpatch"
     # The output latent dimension (channels).
     latent_channels: int = 16
     # The encoder output channels just before sampling.

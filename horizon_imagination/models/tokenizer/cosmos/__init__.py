@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import Any, Union
 
 import lightning as L
@@ -32,6 +33,9 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
     class Config(BaseConfig):
         network_cfg: Union[ContinuousImageTokenizerConfig, DiscreteImageTokenizerConfig]
         precision: torch.dtype = None
+        # Run tokenizer forward computation in this dtype while retaining FP32
+        # parameters and optimizer state. None disables local autocast.
+        autocast_dtype: torch.dtype = None
         optimizer_cfg: OptimizerConfig
 
         @property
@@ -58,42 +62,47 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
         self.color_loss = YCbCrColorLoss(ColorConfig())
         self.perceptual_loss = PerceptualLoss(PerceptualConfig())
         self.precision = config.precision
+        self.autocast_dtype = config.autocast_dtype
 
         self.metrics = [PSNRMetric()]
 
     def forward(self, x: Tensor):
-        x = self._preprocess_images(x)
-        res = self.network.forward(x)
-        # return res.latent, self._postprocess_images(res.reconstructions)
-        return self._postprocess_images(res.reconstructions)
+        with self._autocast(x):
+            x = self._preprocess_images(x)
+            res = self.network.forward(x)
+            # return res.latent, self._postprocess_images(res.reconstructions)
+            return self._postprocess_images(res.reconstructions)
     
     def encode(self, x):
-        x = self._preprocess_images(x)
-        z = self.network.encode(x)
-        if isinstance(self.network, ContinuousImageTokenizer):
-            z = z[0]
-        else:
-            indices, z, _ = z
-        return z
+        with self._autocast(x):
+            x = self._preprocess_images(x)
+            z = self.network.encode(x)
+            if isinstance(self.network, ContinuousImageTokenizer):
+                z = z[0]
+            else:
+                indices, z, _ = z
+            return z
     
     def decode(self, z):
-        if isinstance(self.network, DiscreteImageTokenizer):
-            z = self.network.quantizer(z)[1]
-        x_hat = self.network.decode(z)
-        return self._postprocess_images(x_hat)
+        with self._autocast(z):
+            if isinstance(self.network, DiscreteImageTokenizer):
+                z = self.network.quantizer(z)[1]
+            x_hat = self.network.decode(z)
+            return self._postprocess_images(x_hat)
 
     def training_step(self, batch, batch_idx, log_dict_fn = None):
         assert self.network.training
-        batch = self._preprocess_images(batch)
-        output_dict = self.network.forward(batch)
-        input_images, recon_images = batch, output_dict[RECON_KEY]
+        with self._autocast(batch):
+            batch = self._preprocess_images(batch)
+            output_dict = self.network.forward(batch)
+            input_images, recon_images = batch, output_dict[RECON_KEY]
 
-        # pass loss_mask to loss computation
-        inputs = {INPUT_KEY: input_images, MASK_KEY: torch.ones_like(input_images)}
+            # pass loss_mask to loss computation
+            inputs = {INPUT_KEY: input_images, MASK_KEY: torch.ones_like(input_images)}
 
-        # Compute losses:
-        color_loss = self.color_loss(inputs, output_dict, batch_idx)['color']
-        perceptual_loss = self.perceptual_loss(inputs, output_dict, batch_idx)
+            # Compute losses:
+            color_loss = self.color_loss(inputs, output_dict, batch_idx)['color']
+            perceptual_loss = self.perceptual_loss(inputs, output_dict, batch_idx)
 
         # log:
         losses = {f"tokenizer/{k}_loss": v.mean() for k, v in perceptual_loss.items()}
@@ -103,6 +112,12 @@ class CosmosImageTokenizer(L.LightningModule, Configurable):
         log_dict_fn(losses, prog_bar=True, on_epoch=True, on_step=False)
 
         return sum([torch.mean(v) if (v.dim() > 0) else v for v in losses.values()])
+
+    def _autocast(self, x: Tensor):
+        """Tokenizer-local AMP; other Agent components remain in FP32."""
+        if self.autocast_dtype is None or x.device.type != 'cuda':
+            return nullcontext()
+        return torch.autocast(device_type='cuda', dtype=self.autocast_dtype)
     
     # def on_before_optimizer_step(self, optimizer):
     #     # Compute the 2-norm for each layer

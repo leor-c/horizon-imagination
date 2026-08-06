@@ -2,6 +2,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 from horizon_imagination.models.tokenizer.cosmos import (
     CosmosImageTokenizer, ContinuousImageTokenizerConfig, OptimizerConfig,
 ) 
@@ -19,7 +21,9 @@ def get_cosmos_tokenizer_online_config(dtype, resolution: int = 64):
 
     network_cfg = ContinuousImageTokenizerConfig(
         attn_resolutions=tuple([16]),
-        patch_size=1,  # 2
+        patch_size=2,  # 2
+        patch_method="rearrange",
+        decoder_output_mode="resize",
         channels_mult=channels_mult,
         spatial_compression=spatial_compression,
         resolution=resolution,
@@ -36,6 +40,7 @@ def get_cosmos_tokenizer_online_config(dtype, resolution: int = 64):
         network_cfg=network_cfg,
         optimizer_cfg=optimizer_cfg,
         precision=dtype,
+        autocast_dtype=torch.bfloat16,
     )
 
     return cosmos_tokenizer_cfg

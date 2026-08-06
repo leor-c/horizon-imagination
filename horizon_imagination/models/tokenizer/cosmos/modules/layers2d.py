@@ -251,10 +251,21 @@ class Decoder(nn.Module):
         self.num_resolutions = len(channels_mult)
         self.num_res_blocks = num_res_blocks
 
-        # UnPatcher.
+        # Output projection: either the original phase-wise unpatching or a
+        # shared full-resolution convolution.
         patch_size = ignore_kwargs.get("patch_size", 1)
-        self.unpatcher = UnPatcher(patch_size, ignore_kwargs.get("patch_method", "rearrange"))
-        out_ch = out_channels * patch_size * patch_size
+        self.patch_size = patch_size
+        self.output_mode = ignore_kwargs.get("decoder_output_mode", "unpatch")
+        if self.output_mode == "unpatch":
+            self.unpatcher = UnPatcher(patch_size, ignore_kwargs.get("patch_method", "rearrange"))
+            out_ch = out_channels * patch_size * patch_size
+        elif self.output_mode == "resize":
+            self.unpatcher = None
+            out_ch = out_channels
+        else:
+            raise ValueError(
+                f"Unknown decoder_output_mode '{self.output_mode}'; expected 'unpatch' or 'resize'."
+            )
 
         # calculate the number of upsample operations
         self.num_upsamples = int(math.log2(spatial_compression)) - int(math.log2(patch_size))
@@ -322,6 +333,10 @@ class Decoder(nn.Module):
 
         h = self.norm_out(h)
         h = nonlinearity(h)
-        h = self.conv_out(h)
-        h = self.unpatcher(h)
+        if self.output_mode == "resize":
+            h = F.interpolate(h, scale_factor=self.patch_size, mode="nearest")
+            h = self.conv_out(h)
+        else:
+            h = self.conv_out(h)
+            h = self.unpatcher(h)
         return h
