@@ -11,7 +11,7 @@ from loguru import logger
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.modules.distributions import SquashedNormal
 from horizon_imagination.modules.lightweight_seq_model import LightweightSeqModel
-from horizon_imagination.modules.regression import RegressionHead
+from horizon_imagination.modules.regression import TwoHotRegressionHead
 
 
 class ActorHead(nn.Module, Configurable, ABC):
@@ -129,10 +129,20 @@ class GaussianActorHead(ActorHead):
 
 
 class CriticHead(nn.Module, Configurable):
+    """
+    A distributional value head: a two-hot distribution over symlog-spaced bins, read out
+    as its expectation. See `TwoHotRegressionHead` for why this beats scalar MSE here --
+    briefly, lambda-returns span orders of magnitude over training, and a squared error
+    is dominated by whichever of them happen to be largest right now.
+    """
+
     @dataclass(kw_only=True)
     class Config(BaseConfig):
         latent_dim: int
-        hl_gauss_num_bins: int = 129
+        num_bins: int = 129
+        # Bin range in *symlog* space, so this covers raw values up to sym_exp(20) ~ 5e8.
+        v_min: float = -20.0
+        v_max: float = 20.0
         device: torch.device = None
         dtype: torch.dtype = None
 
@@ -140,9 +150,11 @@ class CriticHead(nn.Module, Configurable):
         super().__init__(*args, **kwargs)
         self.config = config
 
-        self.head = RegressionHead(
+        self.head = TwoHotRegressionHead(
             in_features=config.latent_dim,
-            sym_log_normalize=True,
+            num_bins=config.num_bins,
+            v_min=config.v_min,
+            v_max=config.v_max,
             sym_exp_order=1,
             device=self.config.device,
             dtype=self.config.dtype,
