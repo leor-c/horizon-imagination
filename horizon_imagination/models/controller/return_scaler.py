@@ -1,36 +1,85 @@
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 
-class EMAScaler:
+class EMAScaler(nn.Module):
+    """
+    An EMA of a symmetric quantile band, used to normalize advantages by the spread of
+    the lambda-returns.
+
+    An `nn.Module` holding buffers rather than plain attributes, so that the estimate
+    is carried by `state_dict()` and survives a checkpoint. It takes a while to warm up
+    -- with the default decay of 0.005 the time constant is ~200 updates -- so a run
+    resumed with a cold scaler spends its first epochs normalizing advantages by
+    whatever spread a single batch happened to show.
+
+    Instances held by `LatentReconstructionResidual` live in a plain dict, outside any
+    `nn.Module`, and so are never moved by `.to(device)`. That is why the first update
+    *assigns* to `.data` (adopting the incoming device and dtype) rather than copying
+    into a buffer that may still be on the CPU.
+    """
+
     def __init__(self, decay: float = 0.001, quantile: float = 0.95):
+        super().__init__()
         self.decay = decay
         self.quantile = quantile
-        self._estimate_high = None
-        self._estimate_low = None
+        self.register_buffer('_estimate_high', torch.zeros(()))
+        self.register_buffer('_estimate_low', torch.zeros(()))
+        self.register_buffer('_initialized', torch.zeros((), dtype=torch.bool))
+
+    @property
+    def initialized(self) -> bool:
+        return bool(self._initialized)
 
     @property
     def estimate_high(self):
-        return self._estimate_high
+        return self._estimate_high if self.initialized else None
 
     @property
     def estimate_low(self):
-        return self._estimate_low
+        return self._estimate_low if self.initialized else None
 
     @property
     def scale(self):
-        return self.estimate_high - self.estimate_low
+        assert self.initialized, "EMAScaler.scale read before the first update()."
+        return self._estimate_high - self._estimate_low
 
+    @torch.no_grad()
     def update(self, values: Tensor):
         high = torch.quantile(values, self.quantile)
         low = torch.quantile(values, 1 - self.quantile)
 
-        if self._estimate_high is None or self._estimate_low is None:
-            self._estimate_high = high
-            self._estimate_low = low
-        else:
-            self._estimate_high = self.decay * high + (1 - self.decay) * self._estimate_high
-            self._estimate_low = self.decay * low + (1 - self.decay) * self._estimate_low
+        if not self.initialized:
+            self._estimate_high.data = high.detach().clone()
+            self._estimate_low.data = low.detach().clone()
+            self._initialized.data = torch.ones_like(self._initialized)
+            return
+
+        # lerp_(end, w) == (1 - w) * self + w * end -- the same EMA as before.
+        self._estimate_high.lerp_(high.to(self._estimate_high), self.decay)
+        self._estimate_low.lerp_(low.to(self._estimate_low), self.decay)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        """
+        Accept checkpoints written before the scaler carried state.
+
+        Those files have none of these keys, and `load_from_checkpoint` loads with
+        `strict=True`, so without this a mid-run checkpoint could no longer be resumed.
+        Dropping the keys from `missing_keys` leaves the scaler uninitialized, which is
+        exactly what it was on a fresh start -- it re-estimates on the next update.
+        """
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+        for name in ('_estimate_high', '_estimate_low', '_initialized'):
+            key = prefix + name
+            if key in missing_keys:
+                missing_keys.remove(key)
 
 
 class BufferScaler:
