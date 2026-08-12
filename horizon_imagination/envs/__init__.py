@@ -1,6 +1,6 @@
 from typing import Literal
 from horizon_imagination.envs.wrappers import (
-    ModalityDictObsWrapper, ImageChannelsFirst, Float32ObsWrapper
+    ModalityDictObsWrapper, ImageChannelsFirst, Float32ObsWrapper, RescaleActionWrapper
 )
 import gymnasium as gym
 
@@ -79,6 +79,10 @@ def make_mujoco_env(
     Gymnasium MuJoCo, served by portal-env's stock `mujoco` server (a bare
     `gymnasium.make`). The observation is the environment's state vector -- there is
     no image -- so none of the image preprocessing wrappers apply.
+
+    `RescaleActionWrapper` goes on first so that everything above it -- and hence the
+    policy, the replay buffer schema and the world model -- sees a `[-1, 1]` action box,
+    matching the tanh-squashed policy.
     """
     import portal_env
 
@@ -87,6 +91,7 @@ def make_mujoco_env(
         env_args=[env_name],
         agent_in_docker=agent_in_docker,
     )
+    env = RescaleActionWrapper(env)
     env = Float32ObsWrapper(env)
     env = ModalityDictObsWrapper(env)
 

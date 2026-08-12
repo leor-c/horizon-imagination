@@ -152,9 +152,44 @@ def test_controller_training_step(action_space):
     if isinstance(action_space, gym.spaces.Box):
         assert 'actor_critic/avg_action_drift' in logged
         assert float(logged['actor_critic/avg_action_drift']) > 0
+        assert 'actor_critic/avg_action_drift_per_step' in logged
+
+        # The policy's spread must stay inside the head's own clamp -- the failure this
+        # path was rewritten for was sigma running all the way to `exp(log_std_max)`.
+        log_std_max = controller.actor_critic.actor.config.log_std_max
+        assert float(logged['actor_critic/policy_sigma_max']) <= np.exp(log_std_max) + 1e-4
+        assert 'actor_critic/pre_tanh_mean_abs' in logged
+        assert 0.0 <= float(logged['actor_critic/tanh_saturation_frac']) <= 1.0
     else:
         assert 'actor_critic/avg_num_action_changes' in logged
+        assert 'actor_critic/policy_sigma_avg' not in logged
     assert 'actor_critic/avg_action_change_time' in logged
+
+
+def test_imagined_actions_stay_inside_the_box():
+    """
+    The regression test for the out-of-distribution failure: imagination never clipped,
+    so an unbounded policy rolled the world model out on actions the replay buffer --
+    and hence the denoiser and reward head -- had never seen. A squashed policy makes
+    every imagined action in-box by construction.
+    """
+    action_space = gym.spaces.Box(-1.0, 1.0, (ACTION_DIM,), np.float32)
+    controller = _build_controller(action_space)
+
+    recorded = {}
+    original = controller._process_imagined_data
+
+    def capture(traj_segment, *args, **kwargs):
+        recorded['actions'] = [a.detach().clone() for a in traj_segment['action']]
+        return original(traj_segment, *args, **kwargs)
+
+    controller._process_imagined_data = capture
+    controller.training_step(_synthetic_batch(action_space), 0, lambda d, **k: None)
+
+    assert recorded['actions'], "No imagined actions were captured."
+    for step, action in enumerate(recorded['actions']):
+        assert torch.all(action.abs() <= 1.0), \
+            f"Denoising step {step} left the box: max |a| = {action.abs().max().item()}"
 
 
 def test_stable_producer_keeps_actions_coupled_across_denoising_steps():

@@ -19,12 +19,13 @@ from horizon_imagination.models.controller.controller import (
 from horizon_imagination.models.world_model.action_producer import (
     StableContinuousActionProducer, StableDiscreteActionProducer, make_stable_action_producer,
 )
+from horizon_imagination.modules.distributions import SquashedNormal
 from horizon_imagination.modules.embeddings import build_action_embedder, action_dim
 
 
-def _normal(mean, std=None):
+def _squashed(mean, std=None):
     std = torch.ones_like(mean) if std is None else std
-    return Independent(Normal(mean, std), 1)
+    return SquashedNormal(mean, std)
 
 
 class TestGaussianActorHead:
@@ -49,8 +50,7 @@ class TestGaussianActorHead:
         dist = head(torch.randn(4, 3, 8))
 
         assert torch.allclose(
-            dist.base_dist.scale, torch.full_like(dist.base_dist.scale, np.exp(-1.0)),
-            atol=0.05,
+            dist.scale, torch.full_like(dist.scale, np.exp(-1.0)), atol=0.05,
         )
 
     def test_log_std_is_clamped(self):
@@ -60,9 +60,22 @@ class TestGaussianActorHead:
             head.head.weight *= 1e3
             head.head.bias *= 1e3
 
-        scale = head(torch.randn(4, 3, 8)).base_dist.scale
+        scale = head(torch.randn(4, 3, 8)).scale
         assert torch.all(scale >= np.exp(-0.5) - 1e-5)
         assert torch.all(scale <= np.exp(0.5) + 1e-5)
+
+    def test_actions_are_inside_the_box(self):
+        """
+        The property the whole squash exists for: imagination conditions the world model
+        on these actions, and the replay buffer only ever held in-box ones.
+        """
+        head = self._head()
+        with torch.no_grad():  # push the pre-tanh mean far outside the box
+            head.head.weight *= 1e3
+            head.head.bias *= 1e3
+
+        action = head(torch.randn(4, 3, 8)).sample()
+        assert torch.all(action.abs() <= 1.0)
 
     def test_actor_bias_is_rejected(self):
         with pytest.raises(AssertionError, match="actor_bias"):
@@ -72,68 +85,98 @@ class TestGaussianActorHead:
 class TestStableContinuousActionProducer:
     def test_reuses_one_noise_draw_across_calls(self):
         """
-        The whole point of the stable producer: with `eps` held fixed, moving the
-        policy's mean by `d` moves the action by exactly `d`, instead of resampling
-        somewhere unrelated.
+        The whole point of the stable producer: with `eps` held fixed the action is a
+        deterministic, continuous function of the policy parameters, so it tracks a
+        drifting policy instead of resampling somewhere unrelated.
         """
         producer = StableContinuousActionProducer()
         mean = torch.randn(2, 4, 3)
 
-        a0, _ = producer(_normal(mean))
+        a0, _ = producer(_squashed(mean))
         shift = torch.randn(2, 4, 3)
-        a1, _ = producer(_normal(mean + shift))
+        a1, _ = producer(_squashed(mean + shift))
 
-        assert torch.allclose(a1 - a0, shift, atol=1e-6)
+        eps = producer.eps
+        assert torch.allclose(a0, torch.tanh(mean + eps), atol=1e-6)
+        assert torch.allclose(a1, torch.tanh(mean + shift + eps), atol=1e-6)
 
-    def test_action_tracks_the_std(self):
+    def test_action_moves_monotonically_with_the_mean(self):
+        """`tanh` is monotone, so a shift of the mean moves the action the same way."""
         producer = StableContinuousActionProducer()
         mean = torch.zeros(2, 4, 3)
 
-        a0, _ = producer(_normal(mean, std=torch.ones_like(mean)))
-        a1, _ = producer(_normal(mean, std=torch.full_like(mean, 2.0)))
+        a0, _ = producer(_squashed(mean))
+        shift = torch.rand(2, 4, 3) + 0.1  # strictly positive
+        a1, _ = producer(_squashed(mean + shift))
 
-        assert torch.allclose(a1, 2 * a0, atol=1e-6)
+        assert torch.all(a1 > a0)
+        assert torch.all(a1.abs() < 1.0)
+
+    def test_action_tracks_the_std(self):
+        """A wider policy pushes the action further along the sign of its own noise."""
+        producer = StableContinuousActionProducer()
+        mean = torch.zeros(2, 4, 3)
+
+        a0, _ = producer(_squashed(mean, std=torch.ones_like(mean)))
+        a1, _ = producer(_squashed(mean, std=torch.full_like(mean, 2.0)))
+
+        assert torch.all(a1.abs() > a0.abs())
+        assert torch.all(torch.sign(a1) == torch.sign(a0))
 
     def test_log_prob_matches_the_distribution(self):
         producer = StableContinuousActionProducer()
         mean, std = torch.randn(2, 4, 3), torch.rand(2, 4, 3) + 0.1
-        dist = _normal(mean, std)
+        dist = _squashed(mean, std)
 
         action, log_pi = producer(dist)
 
         assert action.shape == (2, 4, 3)
         assert log_pi.shape == (2, 4)
-        assert torch.allclose(log_pi, Normal(mean, std).log_prob(action).sum(-1), atol=1e-6)
+        assert torch.all(action.abs() < 1.0)
+
+        # Independently: the Gaussian density at the pre-squash point, minus the tanh
+        # log-Jacobian, computed here in its naive (unstable but transparent) form.
+        u = torch.atanh(action)
+        expected = (
+            Normal(mean, std).log_prob(u).sum(-1)
+            - torch.log(1 - action.pow(2)).sum(-1)
+        )
+        assert torch.allclose(log_pi, expected, atol=1e-4)
 
     def test_action_is_detached_so_reinforce_keeps_its_gradient(self):
         """
-        Regression guard for the reparameterization trap: if the returned action kept
-        its graph, `log_prob(a)` would reduce to `-eps^2/2 - log(std) - c`, whose
-        gradient w.r.t. the mean is exactly zero -- the policy mean would never learn.
+        Regression guard for the reparameterization trap. The score-function estimator
+        `-log_pi(a) * adv` is only valid when `a` is a constant, so the gradient of
+        `log_pi` w.r.t. the mean must be exactly the Gaussian score `eps / std`.
+
+        Checking merely that the gradient is non-zero is not enough here: with a live
+        action the tanh Jacobian term contributes `-2 * tanh(u) * du/dmean`, so the
+        gradient would be wrong rather than absent.
         """
         mean = torch.randn(2, 4, 3, requires_grad=True)
         std = torch.rand(2, 4, 3) + 0.1
 
-        action, log_pi = StableContinuousActionProducer()(_normal(mean, std))
+        producer = StableContinuousActionProducer()
+        action, log_pi = producer(_squashed(mean, std))
 
         assert not action.requires_grad
         log_pi.sum().backward()
-        assert mean.grad is not None and mean.grad.abs().max() > 0
+        assert torch.allclose(mean.grad, producer.eps / std, atol=1e-5)
 
-    def test_a_live_action_would_zero_the_mean_gradient(self):
+    def test_a_live_sample_would_corrupt_the_mean_gradient(self):
         """The failure mode the test above guards against, shown explicitly."""
         mean = torch.randn(2, 4, 3, requires_grad=True)
         std = torch.rand(2, 4, 3) + 0.1
         eps = torch.randn(2, 4, 3)
 
-        live_action = mean + std * eps  # NOT detached
-        _normal(mean, std).log_prob(live_action).sum().backward()
+        live_u = mean + std * eps  # NOT detached
+        _squashed(mean, std).log_prob_from_pre_tanh(live_u).sum().backward()
 
-        assert torch.allclose(mean.grad, torch.zeros_like(mean.grad), atol=1e-6)
+        assert not torch.allclose(mean.grad, eps / std, atol=1e-5)
 
     def test_dispatch_by_distribution(self):
         assert isinstance(
-            make_stable_action_producer(_normal(torch.zeros(2, 3, 4))),
+            make_stable_action_producer(_squashed(torch.zeros(2, 3, 4))),
             StableContinuousActionProducer,
         )
         assert isinstance(
@@ -147,9 +190,9 @@ class TestDistributionHelpers:
     def _make(family, b=2, t=5, a=3):
         if family == "categorical":
             return Categorical(logits=torch.randn(b, t, a, requires_grad=True))
-        return _normal(torch.randn(b, t, a, requires_grad=True), torch.rand(b, t, a) + 0.1)
+        return _squashed(torch.randn(b, t, a, requires_grad=True), torch.rand(b, t, a) + 0.1)
 
-    @pytest.mark.parametrize("family", ["categorical", "normal"])
+    @pytest.mark.parametrize("family", ["categorical", "squashed"])
     def test_detach_drops_the_graph_but_not_the_values(self, family):
         dist = self._make(family)
         detached = _detach_dist(dist)
@@ -158,7 +201,7 @@ class TestDistributionHelpers:
         assert torch.allclose(detached.log_prob(sample), dist.log_prob(sample))
         assert not detached.log_prob(sample).requires_grad
 
-    @pytest.mark.parametrize("family", ["categorical", "normal"])
+    @pytest.mark.parametrize("family", ["categorical", "squashed"])
     def test_slice_and_cat_along_batch_dims(self, family):
         dist = self._make(family, b=2, t=5)
 

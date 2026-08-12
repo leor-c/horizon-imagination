@@ -1,7 +1,7 @@
 from typing import Literal, Optional
 import lightning as L
 import torch
-from torch.distributions import Distribution, Categorical, Independent, Normal, kl_divergence
+from torch.distributions import Distribution, Categorical, kl_divergence
 from einops import rearrange, repeat
 
 import gymnasium as gym
@@ -13,6 +13,7 @@ import episodata as ed
 
 from horizon_imagination.models.controller.actor_critic import ActorCritic, OutputsBuffer
 from horizon_imagination.models.controller.return_scaler import EMAScaler
+from horizon_imagination.modules.distributions import SquashedNormal, sample_with_log_prob
 from horizon_imagination.models.controller.intrinsic_reward import LatentReconstructionResidual
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
 from horizon_imagination.utilities import AdamWConfig, shift_fwd, RawMultiModalObs, TensorDictRollingContextBuffer
@@ -145,12 +146,8 @@ def _detach_dist(dist: Distribution) -> Distribution:
     """A copy of `dist` whose parameters carry no gradient."""
     if isinstance(dist, Categorical):
         return Categorical(logits=dist.logits.detach())
-    if isinstance(dist, Independent):
-        base = dist.base_dist
-        assert isinstance(base, Normal), f"Got {type(base)}"
-        return Independent(
-            Normal(base.loc.detach(), base.scale.detach()), dist.reinterpreted_batch_ndims
-        )
+    if isinstance(dist, SquashedNormal):
+        return SquashedNormal(dist.loc.detach(), dist.scale.detach())
 
     raise NotImplementedError(f"Cannot detach policy distribution {type(dist)}.")
 
@@ -159,12 +156,10 @@ def _slice_dist(dist: Distribution, index) -> Distribution:
     """Index a policy distribution along its batch dims, as if it were a tensor."""
     if isinstance(dist, Categorical):
         return Categorical(logits=dist.logits[index])
-    if isinstance(dist, Independent):
-        base = dist.base_dist
-        assert isinstance(base, Normal), f"Got {type(base)}"
-        return Independent(
-            Normal(base.loc[index], base.scale[index]), dist.reinterpreted_batch_ndims
-        )
+    if isinstance(dist, SquashedNormal):
+        # `loc` is (..., A) and `index` addresses the batch dims only, so the action
+        # axis survives and `SquashedNormal` re-infers its event shape from it.
+        return SquashedNormal(dist.loc[index], dist.scale[index])
 
     raise NotImplementedError(f"Cannot index policy distribution {type(dist)}.")
 
@@ -174,13 +169,10 @@ def _cat_dists(dists: list[Distribution], dim: int) -> Distribution:
     first = dists[0]
     if isinstance(first, Categorical):
         return Categorical(logits=torch.cat([d.logits for d in dists], dim=dim))
-    if isinstance(first, Independent):
-        return Independent(
-            Normal(
-                torch.cat([d.base_dist.loc for d in dists], dim=dim),
-                torch.cat([d.base_dist.scale for d in dists], dim=dim),
-            ),
-            first.reinterpreted_batch_ndims,
+    if isinstance(first, SquashedNormal):
+        return SquashedNormal(
+            torch.cat([d.loc for d in dists], dim=dim),
+            torch.cat([d.scale for d in dists], dim=dim),
         )
 
     raise NotImplementedError(f"Cannot concatenate policy distributions {type(first)}.")
@@ -466,10 +458,10 @@ class Controller(L.LightningModule, Configurable):
         """
         Clip a sampled action into the action space (a no-op for discrete spaces).
 
-        This is the one place the `Box` bounds are enforced: the Gaussian policy is
-        deliberately unbounded, which keeps its log-prob and entropy exact, so the
-        sample is clipped where it leaves the policy -- once, so that the environment,
-        the replay buffer and the context buffer all see the same action.
+        A safety net rather than the load-bearing bound: the policy is tanh-squashed,
+        so it already emits `(-1, 1)`, and `RescaleActionWrapper` makes every `Box`
+        exactly `[-1, 1]`. What is left for this to catch is `tanh` rounding to exactly
+        +-1.0 in fp32, and an env reached without the rescaling wrapper.
         """
         if isinstance(self.action_space, gym.spaces.Discrete):
             return action
@@ -509,8 +501,7 @@ class Controller(L.LightningModule, Configurable):
         context_obs = world_model.get_obs_from_batch(batch)
         pad_mask = batch['mask']
         action_dist, value, v_logits = self.actor_critic.reset(context_actions, context_obs, pad_mask)
-        first_action = action_dist.sample()
-        first_action_log_p = action_dist.log_prob(first_action)
+        first_action, first_action_log_p = sample_with_log_prob(action_dist)
         first_step_outs = (action_dist, first_action_log_p, value, v_logits)
 
         # set wm context:
@@ -594,6 +585,9 @@ class Controller(L.LightningModule, Configurable):
         action_changes_stats = self._collect_action_changes_stats(
             actions=traj_segment['action'],
             denoising_times=traj_segment['denoising_times']
+        )
+        action_changes_stats.update(
+            self._collect_policy_stats(actor_critic_outs, traj_segment, valid_mask[-1])
         )
         name = 'actor_critic'
         info = {
@@ -688,6 +682,35 @@ class Controller(L.LightningModule, Configurable):
         else:
             traj_segment['reward'] = extrinsic_reward + scaled_intrinsic_reward
 
+    @torch.no_grad()
+    def _collect_policy_stats(self, actor_critic_outs, traj_segment, clean_valid_mask) -> dict:
+        """
+        Where the squashed policy is actually sitting: its spread, how far the pre-tanh
+        mean has travelled, and how much of the time tanh is saturated.
+
+        These are the direct read-outs for the failure this head was rewritten to fix --
+        a policy whose sigma ran away to its clamp, or whose mean ran far enough out that
+        tanh pins every action to a corner of the box. `pre_tanh_mean_abs` is the one to
+        watch: if it grows without bound the mean needs a bound of its own, which the
+        squash alone does not provide.
+
+        Read from the *clean* actor (the last recorded denoising step), which is the one
+        whose distribution `clean_valid_mask` is shaped for.
+        """
+        dist = actor_critic_outs.actions_dist[-1]
+        if not isinstance(dist, SquashedNormal):
+            return {}
+
+        valid = torch.where(clean_valid_mask)
+        clean_actions = traj_segment['action'][-1]
+
+        return {
+            'policy_sigma_avg': dist.scale[valid].mean(),
+            'policy_sigma_max': dist.scale[valid].max(),
+            'pre_tanh_mean_abs': dist.loc[valid].abs().mean(),
+            'tanh_saturation_frac': (clean_actions[valid].abs() > 0.99).float().mean(),
+        }
+
     def _collect_action_changes_stats(self, actions, denoising_times) -> dict:
         """
         How much, and how late, the sampled action moves over the denoising process --
@@ -718,10 +741,17 @@ class Controller(L.LightningModule, Configurable):
         # Change-weighted mean denoising time, over the entries that moved at all:
         avg_change_time = (change_size * change_times).sum(dim=0)[moved] / total_change[moved]
 
-        return {
+        stats = {
             size_key: total_change.mean(),
             'avg_action_change_time': avg_change_time.mean(),
         }
+        # `total_change` is a path *length* accumulated over every denoising step, so it
+        # scales with the step budget and is not comparable across `--budget` settings.
+        # The per-step figure is: for a squashed policy each step is bounded by the box
+        # diameter `2 * sqrt(action_dim)`, and a settled policy should sit far below it.
+        stats[f'{size_key}_per_step'] = total_change.mean() / change_size.shape[0]
+
+        return stats
     
     def configure_optimizers(self):
         return torch.optim.AdamW(

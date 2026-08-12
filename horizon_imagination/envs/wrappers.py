@@ -21,6 +21,50 @@ def auto_detect_modality(obs_space: gym.spaces.Space) -> Modality:
         raise ValueError(f"Observation space '{obs_space}' is not supported or could not be detected automatically.")
 
 
+class RescaleActionWrapper(gym.ActionWrapper):
+    """
+    Present every ``Box`` action space as ``[-1, 1]``, mapping back affinely on the way in.
+
+    The tanh-squashed policy emits ``(-1, 1)``, so the agent, the replay buffer and the
+    world model all speak that scale; this is what makes them agree with an environment
+    whose native bounds are something else. A no-op for the MuJoCo tasks that are
+    already ``[-1, 1]`` (HalfCheetah, Hopper, Walker2d, Ant), but load-bearing for
+    Humanoid (``[-0.4, 0.4]``) and Pusher (``[-2, 2]``), which would otherwise be driven
+    at the wrong scale with no error.
+
+    Passes non-``Box`` spaces straight through, so it can be applied unconditionally --
+    unlike ``gymnasium.wrappers.RescaleAction``, which asserts on the space in its
+    constructor and re-asserts the incoming bounds on every step (fp32 ``tanh`` reaching
+    exactly +-1.0 is enough to trip it).
+    """
+
+    def __init__(self, env: Env[ObsType, ActType]):
+        super().__init__(env)
+
+        # `action_space` may be a property doing an RPC round-trip (portal-env), so read
+        # it once here rather than per step.
+        inner = env.action_space
+        self._is_box = isinstance(inner, gym.spaces.Box)
+        if not self._is_box:
+            return
+
+        self._low, self._high = np.asarray(inner.low), np.asarray(inner.high)
+        assert np.all(np.isfinite(self._low)) and np.all(np.isfinite(self._high)), \
+            f"An unbounded Box cannot be rescaled affinely; got {inner}."
+        self._dtype = inner.dtype
+        self.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=inner.shape, dtype=inner.dtype
+        )
+
+    def action(self, action):
+        if not self._is_box:
+            return action
+
+        action = np.clip(action, -1.0, 1.0)
+        rescaled = self._low + (action + 1.0) * 0.5 * (self._high - self._low)
+        return rescaled.astype(self._dtype)
+
+
 class ModalityDictObsWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)

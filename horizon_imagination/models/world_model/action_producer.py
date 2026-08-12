@@ -4,6 +4,8 @@ from torch import Tensor
 import torch
 import torch.nn.functional as F
 
+from horizon_imagination.modules.distributions import SquashedNormal, sample_with_log_prob
+
 
 class ActionProducer(ABC):
     """
@@ -125,19 +127,24 @@ class StableContinuousActionProducer(ActionProducer):
     The continuous counterpart of `StableDiscreteActionProducer`.
 
     One standard-normal draw `eps` is made on the first call and reused for the rest of
-    the denoising process, so the action is re-derived at every step by the
-    reparameterization `a = mean + std * eps`. Holding `eps` fixed is what makes the
-    sampler *stable*: as the policy distribution drifts across denoising steps the
-    action follows it continuously, instead of jumping to an unrelated point of the
-    action space the way an independent draw per step would.
+    the denoising process, so the action is re-derived at every step as
+    `a = tanh(mean + std * eps)`. Holding `eps` fixed is what makes the sampler
+    *stable*: `tanh` is monotone, so as the policy distribution drifts across denoising
+    steps the action follows it continuously, instead of jumping to an unrelated point
+    of the action space the way an independent draw per step would.
 
     The returned action is detached. The actor loss is REINFORCE
     (`-log_pi(a) * advantage`), whose estimator requires the action to be a constant:
-    substituting a live `a = mean + std * eps` into `log_prob` collapses it to
-    `-eps^2/2 - log(std) - c`, which has *zero* gradient w.r.t. the mean. The
-    reparameterization is used here for its coupling across denoising steps, not for
-    pathwise gradients -- those cannot flow anyway, since the denoiser runs under
-    `torch.no_grad()`.
+    substituting a live `a` into `log_prob` adds a spurious pathwise term and no longer
+    estimates `grad log pi`. The reparameterization is used here for its coupling across
+    denoising steps, not for pathwise gradients -- those cannot flow anyway, since the
+    denoiser runs under `torch.no_grad()`.
+
+    The log-prob is taken at the *pre-squash* point `u`, which is the exact pre-image of
+    `a` -- strictly better conditioned than `atanh(a)`, which blows up at the boundary.
+    With `u` detached the tanh Jacobian term is a constant, so it shifts `log_pi` but
+    contributes no gradient: `d log_pi / d mean` is still `eps / std`, exactly the score
+    of the underlying Gaussian.
     """
 
     def __init__(self, generator=None):
@@ -145,16 +152,16 @@ class StableContinuousActionProducer(ActionProducer):
         self.generator = generator
         self.eps = None
 
-    def __call__(self, x: torch.distributions.Independent, *args, **kwargs):
-        mean, std = x.base_dist.loc, x.base_dist.scale
+    def __call__(self, x: SquashedNormal, *args, **kwargs):
+        mean, std = x.loc, x.scale
 
         if self.eps is None:
             self.eps = torch.randn(
                 mean.shape, device=mean.device, dtype=mean.dtype, generator=self.generator
             )
 
-        a = (mean + std * self.eps).detach()
-        return a, x.log_prob(a)
+        u = (mean + std * self.eps).detach()
+        return torch.tanh(u), x.log_prob_from_pre_tanh(u)
 
 
 class StablePseudoPolicyActionProducer(PseudoPolicyActionProducer):
@@ -168,10 +175,15 @@ class StablePseudoPolicyActionProducer(PseudoPolicyActionProducer):
     
 
 def make_stable_action_producer(action_dist, generator=None) -> ActionProducer:
-    """Pick the stable sampler matching the policy's output distribution."""
+    """Pick the stable sampler matching the policy's output distribution.
+
+    A bare `Independent(Normal, 1)` is deliberately *not* accepted: it is an unbounded
+    policy, and silently sampling one here is what fed out-of-box actions into
+    imagination. Continuous policies must arrive squashed.
+    """
     if isinstance(action_dist, torch.distributions.Categorical):
         return StableDiscreteActionProducer(generator=generator)
-    if isinstance(action_dist, torch.distributions.Independent):
+    if isinstance(action_dist, SquashedNormal):
         return StableContinuousActionProducer(generator=generator)
 
     raise NotImplementedError(f"No stable sampler for policy distribution {type(action_dist)}.")
@@ -211,6 +223,4 @@ class NaivePolicyActionProducer(ActionProducer):
             action_dist, _, _ = self.actor_critic(
                 prev_actions=None, obs=x, compute_critic=False, noise_level=t, *args, **kwargs
             )
-        a = action_dist.sample()
-        log_prob_a = action_dist.log_prob(a)
-        return a, log_prob_a
+        return sample_with_log_prob(action_dist)

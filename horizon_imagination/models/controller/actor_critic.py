@@ -4,11 +4,12 @@ from typing import Optional, Literal
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.distributions import Distribution, Categorical, Independent, Normal
+from torch.distributions import Distribution, Categorical
 from tensordict.tensordict import TensorDict
 from loguru import logger
 
 from horizon_imagination.utilities.config import Configurable, BaseConfig, dataclass
+from horizon_imagination.modules.distributions import SquashedNormal
 from horizon_imagination.modules.lightweight_seq_model import LightweightSeqModel
 from horizon_imagination.modules.regression import RegressionHead
 
@@ -61,26 +62,43 @@ class DiscreteActorHead(ActorHead):
 
 class GaussianActorHead(ActorHead):
     """
-    A diagonal-Gaussian policy over a continuous (`Box`) action space.
+    A tanh-squashed diagonal-Gaussian policy over a continuous (`Box`) action space.
 
     The head emits `2 * action_dim` values per step, read as [mean | log_std], so the
-    spread is state-dependent. `Independent(..., 1)` sums the per-dimension log-probs
-    and entropies over the action axis, which keeps `log_prob` and `entropy` shaped
+    spread is state-dependent. `SquashedNormal` sums the per-dimension log-probs and
+    entropies over the action axis, which keeps `log_prob` and `entropy` shaped
     (B, T) -- exactly what the actor-critic losses expect from a `Categorical`.
 
-    Actions are unbounded here: the `Box` bounds are enforced once, where the action
-    reaches the environment (see `Controller.collect_data`), which keeps `log_prob`
-    and `entropy` exact rather than needing a squashing correction.
+    Actions are bounded to `(-1, 1)` *by construction*. An earlier version left the
+    Gaussian unbounded and enforced the `Box` only where the action reached the
+    environment, which broke continuous control in two compounding ways:
+
+    * an unbounded Gaussian has entropy `sum(log sigma) + const`, so the entropy bonus
+      `-w * H` fed a constant `-w` gradient into every `log_std` that never vanished
+      and drove sigma to `exp(log_std_max)`; and
+    * only `Controller.collect_data` clipped, so imagination rolled the world model out
+      on actions far outside the box that the replay buffer -- and hence the denoiser
+      and reward head -- had ever seen.
+
+    Squashing removes both: entropy is bounded above by `action_dim * log 2` and starts
+    *falling* once tanh saturates, and every imagined action is in-box.
+
+    The `log_std` clamp stays hard rather than soft because under a squashed entropy
+    both ends are repelling -- at `log_std_max` the bonus pushes sigma down, at
+    `log_std_min` it pushes sigma up -- so neither is an absorbing state.
     """
 
     @dataclass(kw_only=True)
     class Config(ActorHead.Config):
         action_dim: int
         # Initial spread, applied as the bias of the log_std half of the head. exp(-0.5)
-        # ~ 0.6, a reasonable starting scale for the [-1, 1] boxes that are typical.
+        # ~ 0.6 pre-squash, which after tanh covers most of the [-1, 1] box at +-2 sigma.
         init_log_std: float = -0.5
         log_std_min: float = -5.0
-        log_std_max: float = 2.0
+        # exp(1) ~ 2.7 already saturates tanh into near-bang-bang behaviour, and past
+        # that `d a / d u -> 0` would stall the policy, so there is nothing to gain from
+        # the wider range an unsquashed Gaussian wanted.
+        log_std_max: float = 1.0
 
     def __init__(self, config: Config, *args, **kwargs):
         assert config.actor_bias is None, \
@@ -103,11 +121,11 @@ class GaussianActorHead(ActorHead):
             dtype=self.config.dtype,
         )
 
-    def forward(self, x: Tensor) -> Independent:
+    def forward(self, x: Tensor) -> SquashedNormal:
         mean, log_std = self.head(x).chunk(2, dim=-1)
         std = log_std.clamp(self.config.log_std_min, self.config.log_std_max).exp()
 
-        return Independent(Normal(mean, std), 1)
+        return SquashedNormal(mean, std)
 
 
 class CriticHead(nn.Module, Configurable):

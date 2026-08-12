@@ -1,5 +1,6 @@
 from typing import Literal
 import gymnasium as gym
+import numpy as np
 
 from horizon_imagination.utilities.types import Modality, image_keys, vector_keys
 from horizon_imagination.modules.transform import (
@@ -81,6 +82,12 @@ def _get_actor_critic_cfg(
 
 def _get_actor_head_cfg(env_name: str, action_space: gym.Space, latent_dim: int):
     if isinstance(action_space, gym.spaces.Box):
+        # The policy is tanh-squashed, so it can only ever emit (-1, 1). An env whose
+        # box is anything else would be driven at the wrong scale, silently -- wrap it
+        # in `RescaleActionWrapper` (see `horizon_imagination.envs.make_mujoco_env`).
+        assert np.allclose(action_space.low, -1.0) and np.allclose(action_space.high, 1.0), \
+            f"A tanh-squashed policy needs a [-1, 1] Box; got {action_space}. " \
+            f"Apply RescaleActionWrapper to the env."
         return GaussianActorHead.Config(
             latent_dim=latent_dim,
             action_dim=action_dim(action_space),
