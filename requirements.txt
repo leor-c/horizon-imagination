@@ -15,3 +15,4 @@ tqdm
 matplotlib
 rich
 scipy
+episodata>=0.2.0

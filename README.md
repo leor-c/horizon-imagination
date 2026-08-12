@@ -52,7 +52,13 @@ Note: The above videos were geneated using *one* denoising step per frame. The m
 
 
 
-
+## Updates
+### Aug 2026:
+- Highly improved run time, from ~13h to ~6h30m on Atari-100K, through a more efficient tokenizer.
+- Fixed an important bug in return computation.
+- Migrated the data pipeline to use the `episodata` library.
+- Implemented YCbCr image representation for improved efficiency and reduced storage at larger resolutions.
+- In progress: support continuous actions, continuous observations, and multi-modal dict observations.
 
 
 ## 🌿 Branches
