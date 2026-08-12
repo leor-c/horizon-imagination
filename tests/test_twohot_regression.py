@@ -116,6 +116,48 @@ class TestForwardAndLoss:
         assert value.mean().item() == pytest.approx(7.0, rel=0.05)
 
 
+class TestRewardModelShapePaths:
+    """
+    `RewardDoneModel.training_step` feeds the head either a masked 2-D tensor or, with
+    no mask, a 3-D one flattened to 2-D -- and `forward` feeds it 3-D during imagination.
+    All three have to work, since the reward head is upstream of every lambda-return.
+    """
+
+    def test_masked_two_dimensional_path(self):
+        head = _head()
+        x = torch.randn(11, 8)                  # x[torch.where(mask)] -> (n, latent)
+        value, logits = head(x)
+
+        assert value.shape == (11,)
+        assert logits.shape == (11, 129)
+        assert torch.isfinite(head.compute_loss(logits, torch.randn(11)))
+
+    def test_unmasked_flattened_path(self):
+        head = _head()
+        x = torch.randn(3, 5, 8).flatten(0, -2)  # (B, T, latent) -> (B*T, latent)
+        value, logits = head(x)
+
+        assert value.shape == (15,)
+        assert torch.isfinite(head.compute_loss(logits, torch.randn(3, 5).flatten()))
+
+    def test_imagination_forward_path_keeps_batch_and_time(self):
+        head = _head()
+        value, logits = head(torch.randn(4, 6, 8))
+
+        assert value.shape == (4, 6)            # what `imagine` stores as traj reward
+        assert logits.shape == (4, 6, 129)
+
+    def test_l1_diagnostic_still_lines_up(self):
+        """`reward_l1` compares the scalar readout against flattened targets."""
+        head = _head()
+        value, _ = head(torch.randn(3, 5, 8))
+        target = torch.randn(3, 5)
+
+        assert torch.isfinite(
+            torch.nn.functional.l1_loss(value.flatten(), target.flatten())
+        )
+
+
 class TestBoundedReadout:
     def test_value_cannot_exceed_the_bin_range(self):
         """
