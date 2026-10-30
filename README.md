@@ -53,8 +53,11 @@ Note: The above videos were geneated using *one* denoising step per frame. The m
 
 
 ## Updates
+### Oct 2026:
+- Reverted the default tokenizer config to patch size 1 and fp32 (TF32 matmuls), since the patch size 2 / bf16 config could degrade performance in some settings. It is still available in `config/tokenizer/image/cosmos.py` (set `patch_size=2`, `patch_method="rearrange"`, `decoder_output_mode="resize"`, `autocast_dtype=torch.bfloat16`), but the ~6h30m Atari-100K run time below no longer applies to the default config.
+
 ### Aug 2026:
-- Highly improved run time, from ~13h to ~6h30m on Atari-100K, through a more efficient tokenizer.
+- Highly improved run time, from ~13h to ~6h30m on Atari-100K, through a more efficient tokenizer (patch size 2, bf16).
 - Fixed an important bug in return computation.
 - Migrated the data pipeline to use the `episodata` library.
 - Implemented YCbCr image representation for improved efficiency and reduced storage at larger resolutions.
@@ -145,6 +148,14 @@ python experiments/train_agent_online.py \
 ```
 MuJoCo observations are state vectors, so no image tokenizer is built and no
 imagination videos are logged — the vector autoencoder is the only stage-1 encoder.
+
+### Reproduce the paper experiments with W&B
+Create the paper's grid (4 environments × 5 seeds × 3 controller configs = 60 runs), then start one agent per local GPU:
+```bash
+python experiments/launch_sweep.py create-sweep ale
+python experiments/launch_sweep.py run-agents <sweep-id> --benchmark ale --num-gpus 8
+```
+The launcher starts the `portal-env` server itself. Use `craftium` or `mujoco` in place of `ale` for the other benchmarks, and see `--help` for `--max-runs` and `--entity`.
 
 ----
 

@@ -2,8 +2,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
-
 from horizon_imagination.models.tokenizer.cosmos import (
     CosmosImageTokenizer, ContinuousImageTokenizerConfig, OptimizerConfig,
 ) 
@@ -21,9 +19,10 @@ def get_cosmos_tokenizer_online_config(dtype, resolution: int = 64):
 
     network_cfg = ContinuousImageTokenizerConfig(
         attn_resolutions=tuple([16]),
-        patch_size=2,  # 2
-        patch_method="rearrange",
-        decoder_output_mode="resize",
+        # patch_size=2 with patch_method="rearrange" and decoder_output_mode="resize"
+        # (plus autocast_dtype=torch.bfloat16 below) is faster but can degrade
+        # performance, so it is off by default.
+        patch_size=1,
         channels_mult=channels_mult,
         spatial_compression=spatial_compression,
         resolution=resolution,
@@ -40,7 +39,6 @@ def get_cosmos_tokenizer_online_config(dtype, resolution: int = 64):
         network_cfg=network_cfg,
         optimizer_cfg=optimizer_cfg,
         precision=dtype,
-        autocast_dtype=torch.bfloat16,
         torch_compile=True,
         # The upstream Cosmos code notes long-run CUDA-graph instability for
         # the perceptual loss, so use Inductor fusion without CUDA graphs.
